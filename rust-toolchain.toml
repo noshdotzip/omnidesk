@@ -1,0 +1,4 @@
+# Ultidesk pins Rust stable. Do not switch to nightly without an ADR (see docs/adrs).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

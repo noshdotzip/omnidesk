@@ -1,0 +1,29 @@
+# Rust
+/target
+**/target
+Cargo.lock.orig
+
+# Node / Electron
+node_modules/
+dist/
+out/
+.vite/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Ultidesk local runtime state (never commit secrets/identity)
+.ultidesk-dev/
+*.local.json
+identity/
+secrets/
+
+# Generated protocol code (regenerated from protocol/ultidesk.proto)
+packages/protocol-ts/src/generated/

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Strict CSP: no remote content, no inline script except our module bundle. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src 'self' data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
+    />
+    <title>Ultidesk — Source</title>
+    <style>
+      body { font: 13px system-ui, sans-serif; margin: 0; padding: 12px; background: #1b1d22; color: #e6e8ec; }
+      h1 { font-size: 15px; margin: 0 0 8px; }
+      #status { color: #9aa0aa; margin-bottom: 10px; min-height: 18px; }
+      #sources { display: grid; grid-template-columns: 1fr; gap: 6px; }
+      button.source { display: flex; align-items: center; gap: 10px; padding: 6px; background: #2a2d34; border: 1px solid #3a3e47; border-radius: 6px; color: inherit; cursor: pointer; text-align: left; }
+      button.source:hover { border-color: #5b8cff; }
+      button.source img { width: 96px; height: 60px; object-fit: cover; border-radius: 3px; background: #000; }
+      #refresh { margin-bottom: 10px; background: #3a3e47; color: inherit; border: 0; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <h1>Project a window</h1>
+    <button id="refresh">Refresh</button>
+    <div id="status"></div>
+    <div id="sources"></div>
+    <script type="module" src="./picker.js"></script>
+  </body>
+</html>

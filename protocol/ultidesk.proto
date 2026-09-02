@@ -1,0 +1,124 @@
+// Ultidesk canonical wire schema.
+//
+// STATUS: this is the canonical *reference* for the cross-device protocol. In the
+// current MVP slice the only live cross-language contract is the local IPC (agent <->
+// desktop app), carried as JSON whose shapes match `IpcRequest`/`IpcResponse` in both
+// `crates/agent/src/ipc.rs` and `apps/desktop/src/shared/protocol.ts`. Generated
+// bindings (prost for Rust, protobufjs/ts-proto for TS) are introduced in Milestone 1
+// BEFORE any peer-to-peer protocol ships, so the two mirrors are never maintained by
+// hand once real networking exists. See docs/adrs/0004-protocol-schema.md.
+
+syntax = "proto3";
+package ultidesk.v1;
+
+// ---- Envelope ---------------------------------------------------------------
+
+message Envelope {
+  uint32 protocol_version = 1;
+  string message_type = 2;
+  string message_id = 3;      // uuid
+  string session_id = 4;      // uuid
+  string sender_device_id = 5;
+  string recipient_device_id = 6;
+  int64  monotonic_timestamp = 7; // source-monotonic nanos, not wall clock
+  bytes  payload = 8;
+}
+
+// ---- Hello / capability negotiation -----------------------------------------
+
+message Hello {
+  uint32 protocol_version = 1;
+  string device_id = 2;
+  string friendly_name = 3;
+  string os = 4;
+  string arch = 5;
+  uint64 capabilities = 6; // bitset; see core::protocol::Capabilities
+}
+
+// ---- Input (KVM + projection) -----------------------------------------------
+
+enum InputEventType {
+  INPUT_UNKNOWN = 0;
+  POINTER_ABSOLUTE = 1;
+  POINTER_RELATIVE = 2;
+  MOUSE_BUTTON = 3;
+  WHEEL = 4;
+  KEY = 5;
+  LEASE_ACQUIRE = 6;
+  LEASE_RENEW = 7;
+  LEASE_RELEASE = 8;
+  RELEASE_ALL_INPUT = 9;
+}
+
+message InputEvent {
+  uint32 protocol_version = 1;
+  string session_id = 2;
+  string lease_id = 3;
+  string event_id = 4;
+  string origin_device_id = 5;
+  string target_device_id = 6;
+  uint64 sequence_number = 7;
+  int64  monotonic_timestamp = 8;
+  InputEventType event_type = 9;
+  uint32 modifier_state = 10;
+  uint32 hop_count = 11;
+  // Payload is event-type specific (normalized coords, scan code, button, delta).
+  bytes  payload = 12;
+}
+
+// ---- Projection signaling ---------------------------------------------------
+
+message ProjectionOffer {
+  string projection_id = 1;
+  string source_device_id = 2;
+  string destination_device_id = 3;
+  string source_window_title = 4; // display-only, treated as untrusted
+  uint32 source_width = 5;
+  uint32 source_height = 6;
+}
+
+message MediaSignal {
+  string projection_id = 1;
+  enum Kind { SDP_OFFER = 0; SDP_ANSWER = 1; ICE = 2; }
+  Kind kind = 2;
+  string sdp = 3;         // for SDP_OFFER / SDP_ANSWER
+  string ice_candidate = 4; // JSON RTCIceCandidateInit for ICE
+}
+
+message ProjectionStateChange {
+  string projection_id = 1;
+  string state = 2; // mirrors core::projection::ProjectionState
+}
+
+// ---- Handoff (B -> C, media re-sourced from A) ------------------------------
+
+message HandoffPrepare {
+  string projection_id = 1;
+  string current_destination = 2;
+  string new_destination = 3;
+}
+message HandoffCommit { string projection_id = 1; }
+message HandoffAbort { string projection_id = 1; string reason = 2; }
+
+// ---- Clipboard (later milestones) -------------------------------------------
+
+message ClipboardOffer {
+  string clipboard_event_id = 1;
+  string origin_device_id = 2;
+  uint64 origin_sequence = 3;
+  repeated string format_manifest = 4;
+  uint64 total_size = 5;
+}
+
+// ---- File transfer (later milestones) ---------------------------------------
+
+message FileOffer {
+  string transfer_id = 1;
+  string origin_device_id = 2;
+  string destination_device_id = 3;
+  string display_name = 4;
+  string relative_path = 5;
+  uint64 size = 6;
+  string sha256 = 7;
+  uint64 chunk_size = 8;
+}

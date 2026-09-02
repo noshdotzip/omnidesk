@@ -1,0 +1,41 @@
+# Ultidesk Cargo workspace.
+#
+# Only crates that the current verified vertical slice needs are members here.
+# Future subsystems (identity, discovery, control, clipboard, transfer) are NOT
+# scaffolded as empty crates on purpose — see docs/status.md and the engineering
+# rules in the implementation brief ("Do not create hundreds of empty stubs").
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/topology",
+    "crates/platform-windows",
+    "crates/agent",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Pulled in by the platform-windows crate only.
+windows = "0.58"
+
+# Local crates
+ultidesk-core = { path = "crates/core" }
+ultidesk-topology = { path = "crates/topology" }
+ultidesk-platform-windows = { path = "crates/platform-windows" }
+
+[profile.release]
+lto = "thin"

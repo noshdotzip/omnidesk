@@ -1,0 +1,6 @@
+# Normalize line endings to LF in the repo for all text files.
+* text=auto eol=lf
+
+# Lockfiles and generated content
+Cargo.lock -diff
+pnpm-lock.yaml -diff

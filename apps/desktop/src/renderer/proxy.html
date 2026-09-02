@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src 'self' data:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
+    />
+    <title>Ultidesk — Projected (remote)</title>
+    <style>
+      body { margin: 0; background: #000; color: #e6e8ec; font: 12px system-ui, sans-serif; overflow: hidden; }
+      #badge { position: fixed; top: 8px; left: 8px; background: rgba(30,32,38,0.85); border: 1px solid #5b8cff; border-radius: 6px; padding: 3px 8px; pointer-events: none; }
+      #stream { width: 100vw; height: 100vh; object-fit: contain; background: #000; display: block; }
+    </style>
+  </head>
+  <body>
+    <div id="badge">Connecting to source…</div>
+    <video id="stream" autoplay playsinline></video>
+    <script type="module" src="./proxy.js"></script>
+  </body>
+</html>
