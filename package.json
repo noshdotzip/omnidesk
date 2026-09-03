@@ -9,6 +9,8 @@
   },
   "packageManager": "pnpm@10.33.0",
   "scripts": {
+    "preinstall": "node scripts/check-native-arch.mjs",
+    "doctor:arch": "node scripts/check-native-arch.mjs",
     "proto:gen": "pnpm --filter @ultidesk/protocol-ts run generate",
     "typecheck": "pnpm -r run typecheck",
     "lint": "pnpm -r run lint",
@@ -20,5 +22,11 @@
   },
   "devDependencies": {
     "typescript": "5.7.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild"
+    ]
   }
 }

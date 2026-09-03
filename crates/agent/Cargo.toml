@@ -22,3 +22,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+
+# The Wayland/portal backend only exists on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+ultidesk-platform-linux = { workspace = true }

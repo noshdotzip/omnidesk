@@ -1,0 +1,22 @@
+[package]
+name = "ultidesk-platform-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The shared, platform-neutral shapes (WindowInfo, RectPx, InputError) live in the
+# windows crate today — its own docs state they exist "so a Linux/macOS backend can
+# later satisfy the same shapes". Depending on it from here honours that intent but
+# reads backwards; the types should move to a neutral crate when a third backend lands.
+ultidesk-platform-windows = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# The D-Bus client is only pulled in when actually targeting Linux, so the workspace
+# still builds on Windows/macOS (where every entry point returns `Unsupported`).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }

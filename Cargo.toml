@@ -10,6 +10,7 @@ members = [
     "crates/core",
     "crates/topology",
     "crates/platform-windows",
+    "crates/platform-linux",
     "crates/agent",
 ]
 
@@ -36,6 +37,13 @@ windows = "0.58"
 ultidesk-core = { path = "crates/core" }
 ultidesk-topology = { path = "crates/topology" }
 ultidesk-platform-windows = { path = "crates/platform-windows" }
+ultidesk-platform-linux = { path = "crates/platform-linux" }
 
 [profile.release]
-lto = "thin"
+# Latency, not throughput, is the metric that matters on the projection hot path
+# (input injection and IPC framing), so trade build time for code quality.
+# `panic` is deliberately left at "unwind": the agent serves each IPC connection on
+# its own thread, and unwinding keeps a handler fault from taking the agent down.
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"

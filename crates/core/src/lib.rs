@@ -11,6 +11,7 @@
 pub mod error;
 pub mod ids;
 pub mod input_guard;
+pub mod kvm;
 pub mod projection;
 pub mod protocol;
 
