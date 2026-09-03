@@ -73,6 +73,15 @@ pub struct CastOptions {
     pub cursor: CursorMode,
 }
 
+/// A grant returned by a previous `Start`, replayed to skip the picker.
+///
+/// Without this the compositor shows its chooser on every launch, which for a window
+/// that is projected all day reads as broken rather than secure.
+#[derive(Debug, Clone, Default)]
+pub struct CastGrant {
+    pub restore_token: Option<String>,
+}
+
 impl Default for CastOptions {
     fn default() -> Self {
         CastOptions {
@@ -105,6 +114,15 @@ impl CastOptions {
     }
 }
 
+/// What a granted `Start` yields.
+#[derive(Debug, Clone, Default)]
+pub struct StartedCast {
+    /// PipeWire node ids, one per source the user granted.
+    pub nodes: Vec<u32>,
+    /// Grant to replay next time so the picker does not reappear.
+    pub restore_token: Option<String>,
+}
+
 #[cfg(target_os = "linux")]
 pub use imp::ScreenCastSession;
 
@@ -123,10 +141,13 @@ impl ScreenCastSession {
 mod imp {
     use super::*;
     use crate::portal::PortalError;
-    use crate::portal_call::{bus, call_and_await, close_session, session_handle};
+    use crate::portal_call::{
+        bus, call_and_await, close_session, session_handle, PORTAL_PATH, PORTAL_SERVICE,
+    };
     use crate::request::sanitize_token;
     use std::collections::HashMap;
-    use zbus::blocking::Connection;
+    use std::os::fd::OwnedFd;
+    use zbus::blocking::{Connection, Proxy};
     use zbus::zvariant::{OwnedObjectPath, Value};
 
     const SCREEN_CAST: &str = "org.freedesktop.portal.ScreenCast";
@@ -167,13 +188,22 @@ mod imp {
         }
 
         /// Declare what kinds of source we will accept. Also silent.
-        pub fn select_sources(&self, options: CastOptions) -> Result<(), PortalError> {
+        pub fn select_sources(
+            &self,
+            options: CastOptions,
+            grant: &CastGrant,
+        ) -> Result<(), PortalError> {
             let tok = self.next_token("select");
             let mut opts: HashMap<&str, Value> = HashMap::new();
             opts.insert("handle_token", Value::from(tok.as_str()));
             opts.insert("types", Value::U32(options.type_bits()));
             opts.insert("multiple", Value::Bool(options.multiple));
             opts.insert("cursor_mode", Value::U32(options.cursor.to_bits()));
+            // 2 = persistent, so the compositor can hand back a restore token.
+            opts.insert("persist_mode", Value::U32(2));
+            if let Some(rt) = grant.restore_token.as_deref() {
+                opts.insert("restore_token", Value::from(rt));
+            }
             tracing::info!(
                 types = options.type_bits(),
                 cursor = options.cursor.to_bits(),
@@ -193,7 +223,7 @@ mod imp {
         /// blocks until the user chooses or cancels (ADR-0009).
         ///
         /// Returns the PipeWire node ids of the streams the user granted.
-        pub fn start(&self) -> Result<Vec<u32>, PortalError> {
+        pub fn start(&self) -> Result<StartedCast, PortalError> {
             let tok = self.next_token("start");
             let mut opts: HashMap<&str, Value> = HashMap::new();
             opts.insert("handle_token", Value::from(tok.as_str()));
@@ -206,6 +236,9 @@ mod imp {
                 &(self.session.clone(), "", opts),
             )?;
 
+            let restore_token = results
+                .get("restore_token")
+                .and_then(|v| String::try_from(v.clone()).ok());
             let mut nodes = Vec::new();
             if let Some(v) = results.get("streams") {
                 let arr = zbus::zvariant::Array::try_from(v.clone()).map_err(bus)?;
@@ -218,7 +251,26 @@ mod imp {
                     }
                 }
             }
-            Ok(nodes)
+            Ok(StartedCast {
+                nodes,
+                restore_token,
+            })
+        }
+
+        /// Open the PipeWire connection carrying the granted streams.
+        ///
+        /// Returns a file descriptor, not a socket path: the portal hands over an
+        /// already-authorised connection so the client never needs access to the
+        /// PipeWire socket itself. It is a direct method with no Request/Response, so
+        /// there is no signal to await here.
+        pub fn open_pipewire_remote(&self) -> Result<OwnedFd, PortalError> {
+            let opts: HashMap<&str, Value> = HashMap::new();
+            let reply = Proxy::new(&self.conn, PORTAL_SERVICE, PORTAL_PATH, SCREEN_CAST)
+                .map_err(bus)?
+                .call_method("OpenPipeWireRemote", &(self.session.clone(), opts))
+                .map_err(bus)?;
+            let fd: zbus::zvariant::OwnedFd = reply.body().deserialize().map_err(bus)?;
+            Ok(OwnedFd::from(fd))
         }
 
         pub fn close(&self) -> Result<(), PortalError> {

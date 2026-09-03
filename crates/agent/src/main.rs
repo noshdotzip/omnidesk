@@ -209,7 +209,9 @@ fn capture_test() -> Result<()> {
 /// in that portal's backend rather than in our Request/Response handling.
 #[cfg(target_os = "linux")]
 fn cast_test() -> Result<()> {
-    use ultidesk_platform_linux::screen_cast::{CastOptions, CursorMode, ScreenCastSession};
+    use ultidesk_platform_linux::screen_cast::{
+        CastGrant, CastOptions, CursorMode, ScreenCastSession,
+    };
 
     let report = ultidesk_platform_linux::probe()?;
     let cursor_bits = 7; // KDE advertises hidden|embedded|metadata
@@ -225,16 +227,49 @@ fn cast_test() -> Result<()> {
         cursor: CursorMode::best_available(cursor_bits).unwrap_or(CursorMode::Embedded),
         ..CastOptions::default()
     };
-    session.select_sources(opts)?;
+    let grant = CastGrant {
+        restore_token: std::env::var("ULTIDESK_CAST_TOKEN").ok(),
+    };
+    session.select_sources(opts, &grant)?;
     eprintln!(
         "SelectSources OK (types={}, cursor={:?})",
         opts.type_bits(),
         opts.cursor
     );
 
-    // Deliberately not calling start(): it opens the compositor's picker.
+    // Start opens the compositor's picker, so it only runs when explicitly asked for.
+    if std::env::args().nth(2).as_deref() != Some("start") {
+        session.close()?;
+        println!("screencast negotiation reached Start-ready state");
+        println!("run 'cast-test start' to open the picker and obtain a PipeWire node");
+        return Ok(());
+    }
+
+    eprintln!("KDE will ask which window to share — pick one to continue.");
+    let started = session.start()?;
+    if started.nodes.is_empty() {
+        anyhow::bail!("the compositor granted no streams");
+    }
+    for node in &started.nodes {
+        println!("pipewire_node={node}");
+    }
+    match started.restore_token.as_deref() {
+        // A capability: printed for this manual test only. It belongs in OS secret
+        // storage once pairing exists, and must never be logged.
+        Some(t) => println!("restore_token={t}"),
+        None => tracing::warn!("no restore token issued; the picker will reappear next run"),
+    }
+
+    let fd = session.open_pipewire_remote()?;
+    // Proving we hold a live, authorised PipeWire connection is the milestone here;
+    // turning it into frames needs a PipeWire client, which is the next step.
+    println!("pipewire fd acquired: {}", {
+        use std::os::fd::AsRawFd;
+        fd.as_raw_fd()
+    });
+
     session.close()?;
-    println!("screencast negotiation reached Start-ready state");
+    println!("screencast session started and closed cleanly");
     Ok(())
 }
 
