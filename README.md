@@ -32,8 +32,21 @@ control transport, clipboard, transfer) are **not** stubbed out — see
 
 ## Prerequisites
 
-- Rust stable (pinned via `rust-toolchain.toml`), tested with 1.93 on `x86_64-pc-windows-msvc`.
+- Rust stable (pinned via `rust-toolchain.toml`), tested with 1.93 on
+  `x86_64-pc-windows-msvc` and 1.86 on `aarch64-pc-windows-msvc`.
 - Node 20+ and pnpm 10+.
+
+**On Windows ARM64, install through Corepack**, not the standalone `pnpm.exe`:
+
+```bash
+corepack enable
+corepack pnpm install
+```
+
+The `pnpm.exe` distributed for Windows is an x64 binary. Under Prism it reports itself
+as x64 and silently installs the x64 esbuild and rollup binaries, which then either run
+emulated or cannot be loaded by native ARM64 Node at all. A `preinstall` check fails the
+install if that happens; see [ADR-0008](docs/adrs/0008-windows-arm64-native.md).
 
 ## Build, test, verify
 
@@ -48,10 +61,13 @@ cargo run -p ultidesk-agent -- enumerate    # prints capturable top-level window
 TypeScript (pure-logic tests + typecheck are verified; GUI run is a follow-up):
 
 ```bash
-ELECTRON_SKIP_BINARY_DOWNLOAD=1 pnpm install
-pnpm --filter @ultidesk/desktop test        # projection-state + mapping parity tests
-pnpm --filter @ultidesk/desktop typecheck
+ELECTRON_SKIP_BINARY_DOWNLOAD=1 corepack pnpm install
+corepack pnpm --filter @ultidesk/desktop test   # projection-state, mapping, media-stats
+corepack pnpm --filter @ultidesk/desktop typecheck
 ```
+
+On x64 a plain `pnpm` works identically; `corepack` is written out here because it is
+the form that is correct on both architectures.
 
 Running the Electron GUI end-to-end requires a renderer bundling step (Vite) that is the
 immediate next task; see [docs/status.md](docs/status.md) and

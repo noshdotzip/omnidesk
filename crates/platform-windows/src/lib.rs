@@ -15,6 +15,7 @@
 mod types;
 pub use types::{RectPx, WindowInfo};
 
+pub mod cursor;
 pub mod inject;
 
 #[cfg(windows)]

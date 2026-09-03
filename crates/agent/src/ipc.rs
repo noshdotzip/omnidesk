@@ -5,6 +5,13 @@
 //! all held keys/buttons when a session ends) is unit-tested with a mock injector,
 //! without needing a pipe, a GUI, or real input.
 
+// Transport-gated, not dead: the only IPC transport that exists today is the Windows
+// named pipe (`#[cfg(windows)] mod pipe`), so on other platforms nothing constructs
+// this module's types and every item reads as dead code under `-D warnings`. The
+// logic is deliberately platform-independent and stays compiled and unit-tested
+// everywhere, ready for the Linux transport (Milestone 9, docs/status.md).
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use ultidesk_core::protocol::PROTOCOL_VERSION;

@@ -9,6 +9,13 @@
 //! OS-level hardening is a follow-up; today the token is the enforced control and the
 //! handshake file is written under a per-user directory.
 
+// Transport-gated, not dead: the only IPC transport that exists today is the Windows
+// named pipe (`#[cfg(windows)] mod pipe`), so on other platforms nothing constructs
+// this module's types and every item reads as dead code under `-D warnings`. The
+// logic is deliberately platform-independent and stays compiled and unit-tested
+// everywhere, ready for the Linux transport (Milestone 9, docs/status.md).
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
