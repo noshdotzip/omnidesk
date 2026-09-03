@@ -261,15 +261,34 @@ fn cast_test() -> Result<()> {
     }
 
     let fd = session.open_pipewire_remote()?;
-    // Proving we hold a live, authorised PipeWire connection is the milestone here;
-    // turning it into frames needs a PipeWire client, which is the next step.
-    println!("pipewire fd acquired: {}", {
-        use std::os::fd::AsRawFd;
-        fd.as_raw_fd()
-    });
+    let node = started.nodes[0];
+    println!("connecting to pipewire node {node} ...");
+
+    let report = ultidesk_platform_linux::pipewire_capture::capture(
+        fd,
+        node,
+        120,
+        std::time::Duration::from_secs(10),
+    )?;
+
+    println!(
+        "frames={} size={}x{} max_fps={}",
+        report.frames, report.width, report.height, report.max_framerate
+    );
+    println!(
+        "  dma-buf frames={}  mapped-memory frames={}",
+        report.dma_buf_frames, report.mem_ptr_frames
+    );
+    if report.frames == 0 {
+        println!("  NO FRAMES: the node produced nothing before the timeout");
+    } else if report.used_zero_copy() {
+        println!("  zero-copy path in use (DMA-BUF) — importable into a hardware encoder");
+    } else {
+        println!("  NOT zero-copy: frames arrived as mapped memory, costing a readback each");
+    }
 
     session.close()?;
-    println!("screencast session started and closed cleanly");
+    println!("screencast session closed cleanly");
     Ok(())
 }
 

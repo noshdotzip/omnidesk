@@ -29,6 +29,7 @@
 pub mod caps;
 pub mod input_capture;
 pub mod keymap;
+pub mod pipewire_capture;
 pub mod pointer;
 pub mod portal;
 pub mod portal_call;
