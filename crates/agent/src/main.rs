@@ -357,7 +357,11 @@ fn kvm_handoff() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(handoff::run(&addr, &token, rw, rh, secs))
+    let keyboard: bool = std::env::args()
+        .nth(7)
+        .map(|s| s != "false" && s != "0" && s != "no")
+        .unwrap_or(true);
+    rt.block_on(handoff::run(&addr, &token, rw, rh, secs, keyboard))
 }
 
 #[cfg(not(windows))]

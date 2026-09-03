@@ -80,8 +80,14 @@ Three independent ways back, each working if the others are broken:
 
 Walking the remote pointer back off the peer's left edge also returns control.
 
-Keyboard is **not** grabbed. Only the mouse is hooked, so a wedged state still
-leaves the keyboard usable — deliberate while the grab path is unproven.
+The keyboard **is** grabbed by default, so keystrokes go to the peer. Pass `false` as
+a seventh argument to hook the mouse only.
+
+A low-level keyboard hook runs *before* the OS dispatches registered hotkeys, so a
+hook that swallowed everything would swallow the emergency combination too. The hook
+therefore never swallows anything while Ctrl+Alt+Shift are held together, and reports
+the release directly. That in-hook route is the one that works when the keyboard is
+grabbed; `RegisterHotKey` remains as an independent second route for when it is not.
 
 If the pointer ever stays stuck after all three routes, that is a serious bug: the
 state machine in `core::kvm` asserts it cannot happen, so capture the exact sequence.
