@@ -56,6 +56,36 @@ and a renderer bundling step (Vite) that is the next task. Once bundling is wire
 Record results in [compatibility.md](compatibility.md). Until these are run, the
 projection capability stays "Untested".
 
+## Manual test: KVM handoff (Windows ARM64 -> Arch Wayland)
+
+**This grabs your pointer.** While control is on the peer, the Windows cursor stops
+moving. Read the release routes before running it.
+
+Start the peer server on Arch (see below), then on Windows:
+
+```bash
+./target/debug/ultidesk-agent.exe kvm-handoff <arch-ip>:45872 <token> 1920 1080 20
+```
+
+Move the pointer to the **right edge** of the Windows screen. Control hands over at
+the matching height on the Arch screen; the Windows cursor freezes and Arch's moves.
+
+Three independent ways back, each working if the others are broken:
+
+1. **Ctrl+Alt+Shift+U** — the emergency hotkey. Registered with `RegisterHotKey`, so
+   the OS delivers it even if the forwarding loop is wedged or blocked on a dead
+   socket.
+2. **Kill the peer** (or pull the network). Any send/receive failure releases.
+3. **Wait.** The session ends after the deadline (20s by default) regardless.
+
+Walking the remote pointer back off the peer's left edge also returns control.
+
+Keyboard is **not** grabbed. Only the mouse is hooked, so a wedged state still
+leaves the keyboard usable — deliberate while the grab path is unproven.
+
+If the pointer ever stays stuck after all three routes, that is a serious bug: the
+state machine in `core::kvm` asserts it cannot happen, so capture the exact sequence.
+
 ## Manual test: mirror the real pointer (Windows ARM64 -> Arch Wayland)
 
 Start the peer server on Arch as described below, then on Windows:

@@ -16,6 +16,7 @@ mod types;
 pub use types::{RectPx, WindowInfo};
 
 pub mod cursor;
+pub mod hook;
 pub mod hotkey;
 pub mod inject;
 

@@ -68,6 +68,14 @@ KDE Plasma Wayland session.
   fires and there is no error to chase. **The D-Bus session for InputCapture is not
   written yet**, and even once it is, actual event delivery needs a libei client
   (`ConnectToEIS` + the `reis` crate). No input has been captured.
+- **KVM handoff implemented, NOT yet run on real hardware** (`kvm-handoff`). Grabs
+  the local pointer with a `WH_MOUSE_LL` hook when it reaches the right edge and
+  forwards motion to the peer. Built on `core::kvm` (10 tests pinning that every
+  release path is unconditional and that a release cannot be undone by the pointer
+  resting on the edge) plus a `RegisterHotKey` emergency release the OS delivers
+  independently of the hook. Compiles and passes tests on both platforms; the grab
+  itself has never been exercised against a real desktop, and should first be tried
+  with the short default deadline and a hand on Ctrl+Alt+Shift+U.
 - **Real-cursor mirroring works** (`kvm-mirror`, verified 2026-09-03). The Windows
   agent reads its actual pointer via `GetCursorPos`, maps it proportionally onto the
   peer's screen with `topology::map_edge_crossing`, and forwards it. Verified across

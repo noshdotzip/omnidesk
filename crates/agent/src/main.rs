@@ -15,6 +15,8 @@
 //!                              DOES prompt for permission and DOES move the cursor.
 
 mod endpoint;
+#[cfg(windows)]
+mod handoff;
 mod ipc;
 #[cfg(windows)]
 mod pipe;
@@ -39,11 +41,12 @@ fn main() -> Result<()> {
         "serve-peer-dev" => serve_peer_dev(),
         "kvm-demo" => kvm_demo(),
         "kvm-mirror" => kvm_mirror(),
+        "kvm-handoff" => kvm_handoff(),
         "serve" => serve(),
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test|serve-peer-dev|kvm-demo|kvm-mirror]"
+                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff]"
             );
             std::process::exit(2);
         }
@@ -322,6 +325,46 @@ fn kvm_mirror() -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(tcp::kvm_mirror(&addr, &token, rw, rh, secs))
+}
+
+/// Hand control of the local pointer to a peer when it crosses the right edge.
+///
+/// Unlike `kvm-mirror` this **grabs** local input: while control is on the peer the
+/// pointer stops moving here. Three independent releases exist — the emergency
+/// hotkey, peer loss, and a hard deadline — see the module docs.
+#[cfg(windows)]
+fn kvm_handoff() -> Result<()> {
+    let addr = std::env::args().nth(2).ok_or_else(|| {
+        anyhow::anyhow!("usage: kvm-handoff <host:port> <token> [remote_w] [remote_h] [seconds]")
+    })?;
+    let token = std::env::args().nth(3).ok_or_else(|| {
+        anyhow::anyhow!("usage: kvm-handoff <host:port> <token> [remote_w] [remote_h] [seconds]")
+    })?;
+    let rw: f64 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1920.0);
+    let rh: f64 = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1080.0);
+    // Deliberately short by default: a bounded session is the backstop while the
+    // grab path is still unproven on real hardware.
+    let secs: u64 = std::env::args()
+        .nth(6)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(handoff::run(&addr, &token, rw, rh, secs))
+}
+
+#[cfg(not(windows))]
+fn kvm_handoff() -> Result<()> {
+    anyhow::bail!(
+        "kvm-handoff needs Windows low-level input hooks; the Linux source side needs libei"
+    )
 }
 
 #[cfg(windows)]

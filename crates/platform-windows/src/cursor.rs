@@ -27,6 +27,26 @@ pub fn cursor_position() -> Option<(i32, i32)> {
     }
 }
 
+/// Move the pointer to an absolute virtual-desktop position.
+///
+/// Used by KVM handoff to re-anchor the cursor after every swallowed move: swallowing
+/// `WM_MOUSEMOVE` freezes the cursor, so absolute positions stop advancing and motion
+/// has to be recovered as a delta from a known anchor instead.
+///
+/// The resulting motion is reported by the OS as injected (`LLMHF_INJECTED`), which is
+/// how the hook tells it apart from the operator's real movement.
+pub fn set_cursor_position(x: i32, y: i32) -> bool {
+    #[cfg(windows)]
+    {
+        imp::set_cursor_position(x, y)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (x, y);
+        false
+    }
+}
+
 /// The bounding box of all monitors.
 pub fn virtual_screen() -> Option<VirtualScreen> {
     #[cfg(windows)]
@@ -44,8 +64,8 @@ mod imp {
     use super::*;
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
+        GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     };
 
     pub fn cursor_position() -> Option<(i32, i32)> {
@@ -53,6 +73,11 @@ mod imp {
         // SAFETY: `p` is a valid, writable POINT for the duration of the call.
         unsafe { GetCursorPos(&mut p) }.ok()?;
         Some((p.x, p.y))
+    }
+
+    pub fn set_cursor_position(x: i32, y: i32) -> bool {
+        // SAFETY: SetCursorPos takes no pointers.
+        unsafe { SetCursorPos(x, y) }.is_ok()
     }
 
     pub fn virtual_screen() -> Option<VirtualScreen> {
