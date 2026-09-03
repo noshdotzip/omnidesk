@@ -1,8 +1,8 @@
 //! Audio routing between machines.
 //!
-//! Sends one machine's audio output to another: the Arch box captures the *monitor* of
-//! a PipeWire sink (what is being played, not a microphone) and streams raw PCM to a
-//! peer, which plays it locally.
+//! Sends one machine's audio output to another, in either direction: Linux captures
+//! a PipeWire sink's monitor, Windows captures its render endpoint via WASAPI loopback,
+//! and the receiving end plays it locally. Either machine can be either end.
 //!
 //! # Why this rides its own connection
 //! The peer control channel is line-delimited JSON, which is the wrong shape for a
@@ -19,15 +19,17 @@
 //! Capture uses the `pw-record` CLI rather than a native PipeWire client. That is a
 //! deliberate first cut: it proves the path and the format end to end without pulling in
 //! a PipeWire binding, and it is the piece to replace when latency is measured and found
-//! wanting. There is no encoding, so this needs ~1.5 Mbit/s — fine on the measured LAN
+//! wanting; the same applies to `pw-play` on the receiving side. There is no encoding,
+//! so this needs ~1.5 Mbit/s — fine on the measured LAN
 //! (167+ Mbit/s), not fine over anything slower.
 
-// One protocol, two platform halves: the sender (Linux/PipeWire) encodes a header
-// and streams PCM; the receiver (Windows/WASAPI) parses and decodes it. Every build
-// compiles both halves' helpers but calls only one set, so the dead-code warnings
-// here are structural rather than real — the mirror image appears on the other
-// platform. The unit tests exercise all of it everywhere, which is what actually
-// keeps the two ends agreeing about the wire format.
+// One protocol, several platform halves: a sender encodes a header and streams PCM,
+// a receiver parses and decodes it, and which of those exist depends on the target
+// (PipeWire capture and playback on Linux, WASAPI playback on Windows). Every build
+// compiles all the helpers but calls only the subset its platform provides, so the
+// dead-code warnings here are structural rather than real. The unit tests exercise
+// all of it everywhere, which is what actually keeps the ends agreeing on the wire
+// format.
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
@@ -213,9 +215,92 @@ pub async fn send(addr: &str, target: &str, format: AudioFormat) -> anyhow::Resu
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Capture what this machine is playing (WASAPI loopback) and stream it to a peer.
+///
+/// `requested` is **ignored**: in shared mode the endpoint's mix format is not
+/// negotiable, so the capture reports what the device actually gave us and that is what
+/// goes in the header. Claiming the requested format instead would mislabel the stream
+/// and the receiver would play it at the wrong speed.
+#[cfg(windows)]
+pub async fn send(addr: &str, _target: &str, requested: AudioFormat) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+    use ultidesk_platform_windows::loopback::spawn_loopback_capture;
+
+    let capture = spawn_loopback_capture().context("starting WASAPI loopback capture")?;
+    let format = AudioFormat {
+        rate: capture.rate,
+        channels: capture.channels,
+    };
+    if format.rate != requested.rate || format.channels != requested.channels {
+        println!(
+            "note: device mixes at {} Hz x{}; streaming that rather than the requested {} Hz x{}",
+            format.rate, format.channels, requested.rate, requested.channels
+        );
+    }
+    // A 5.1 endpoint would need a downmix, which is not implemented. Failing here beats
+    // sending six interleaved channels labelled as two and playing noise.
+    anyhow::ensure!(
+        format.is_supported(),
+        "the default output mixes at {} Hz x{} channels, which this stream format does not \
+         cover (mono/stereo only). Set the Windows output to stereo, or implement a downmix.",
+        format.rate,
+        format.channels
+    );
+
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("could not connect to audio peer at {addr}"))?;
+    stream
+        .write_all(AudioHeader::new(format).encode()?.as_bytes())
+        .await?;
+    stream.flush().await?;
+
+    println!(
+        "streaming {} Hz x{} to {addr}",
+        format.rate, format.channels
+    );
+    let mut total = 0usize;
+    let mut bytes = Vec::new();
+
+    // A peer hanging up is the normal way this ends, not a failure, so the write
+    // error breaks the loop and the summary still prints. Only losing the capture
+    // thread is an actual error.
+    let outcome: anyhow::Result<()> = loop {
+        match capture.samples.try_recv() {
+            Ok(samples) => {
+                bytes.clear();
+                bytes.reserve(samples.len() * AudioFormat::BYTES_PER_SAMPLE);
+                for s in samples {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                if stream.write_all(&bytes).await.is_err() {
+                    break Ok(()); // peer closed the connection
+                }
+                total += bytes.len();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // Loopback produces nothing while the endpoint is idle.
+                tokio::time::sleep(std::time::Duration::from_millis(4)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                break Err(anyhow::anyhow!("the loopback capture thread stopped"));
+            }
+        }
+    };
+
+    println!(
+        "sent {:.1} MB, {} frames (~{:.1}s)",
+        total as f64 / 1e6,
+        format.frames_in(total),
+        format.duration_ms(total) / 1000.0
+    );
+    outcome
+}
+#[cfg(not(any(windows, target_os = "linux")))]
 pub async fn send(_addr: &str, _target: &str, _format: AudioFormat) -> anyhow::Result<()> {
-    anyhow::bail!("audio capture currently uses PipeWire and is Linux-only")
+    anyhow::bail!("audio capture needs PipeWire (Linux) or WASAPI loopback (Windows)")
 }
 
 // ---- receiver: Windows / WASAPI via cpal -------------------------------------------
@@ -342,9 +427,95 @@ pub async fn recv(bind: &str, latency_ms: f64) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// Accept one audio stream and play it through PipeWire.
+///
+/// Symmetric with [`send`]: `pw-play` is the counterpart to `pw-record`, and PipeWire
+/// does its own buffering, so `latency_ms` is not used here. Replacing both with a
+/// native PipeWire client is the same follow-up.
+#[cfg(target_os = "linux")]
+pub async fn recv(bind: &str, _latency_ms: f64) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("failed to bind {bind}"))?;
+    println!("waiting for an audio peer on {bind}");
+
+    let (stream, peer) = listener.accept().await?;
+    println!("audio peer connected: {peer}");
+    let mut reader = BufReader::new(stream);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let header = AudioHeader::parse(&line).map_err(|e| anyhow::anyhow!(e))?;
+    let format = header.format;
+    println!("stream: {} Hz x{}", format.rate, format.channels);
+
+    let mut child = tokio::process::Command::new("pw-play")
+        .arg(format!("--rate={}", format.rate))
+        .arg(format!("--channels={}", format.channels))
+        .arg("--format=s16")
+        .arg("--raw")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not start pw-play (is pipewire installed?)")?;
+
+    let mut sink = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("pw-play accepted no stdin"))?;
+
+    println!("playing via pw-play — Ctrl+C to stop");
+
+    // Counted manually rather than with tokio::io::copy so the total survives an
+    // error: a stream that breaks midway is exactly when knowing how much arrived
+    // matters, and copy() only reports its count on success. A reset is also how a
+    // hard-killed sender looks, which is ordinary rather than exceptional.
+    let mut total = 0usize;
+    let mut buf = vec![0u8; 8192];
+    let outcome = loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                total += n;
+                if sink.write_all(&buf[..n]).await.is_err() {
+                    break Err(anyhow::anyhow!("pw-play stopped accepting audio"));
+                }
+            }
+            Err(e) => break Err(anyhow::Error::from(e)),
+        }
+    };
+
+    // Dropping stdin lets pw-play drain and exit rather than linger holding a stream.
+    drop(sink);
+    let _ = child.wait().await;
+
+    println!(
+        "audio peer disconnected after {:.1} MB, {} frames (~{:.1}s)",
+        total as f64 / 1e6,
+        format.frames_in(total),
+        format.duration_ms(total) / 1000.0
+    );
+    // A peer that vanished is not a failure worth a non-zero exit; a broken pipe to
+    // pw-play is.
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(e) if e.downcast_ref::<std::io::Error>().is_some() => {
+            println!("(stream ended abruptly: {e})");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub async fn recv(_bind: &str, _latency_ms: f64) -> anyhow::Result<()> {
-    anyhow::bail!("audio playback currently uses cpal/WASAPI and is Windows-only")
+    anyhow::bail!("audio playback needs WASAPI (Windows) or PipeWire (Linux)")
 }
 
 #[cfg(test)]

@@ -56,7 +56,40 @@ and a renderer bundling step (Vite) that is the next task. Once bundling is wire
 Record results in [compatibility.md](compatibility.md). Until these are run, the
 projection capability stays "Untested".
 
-## Manual test: audio routing (Arch -> Windows)
+## Manual test: audio routing (either direction)
+
+Start the **receiver** first so the port is listening, then the sender. Both
+subcommands exist on both platforms; each picks the right backend for its OS.
+
+Arch -> Windows:
+
+```bash
+# Windows
+./target/debug/ultidesk-agent.exe audio-recv 0.0.0.0:45873 120
+# Arch  (find a sink first: pw-cli ls Node | grep -B2 'Audio/Sink')
+./target/debug/ultidesk-agent audio-send <windows-ip>:45873 <sink-name>.monitor 48000 2
+```
+
+Windows -> Arch:
+
+```bash
+# Arch
+./target/debug/ultidesk-agent audio-recv 0.0.0.0:45874 120
+# Windows  (the target argument is ignored; WASAPI captures the default output)
+./target/debug/ultidesk-agent.exe audio-send <arch-ip>:45874 ignored 48000 2
+```
+
+Play something on the sending machine and it should come out of the receiver. Both
+ends print bytes and frames on disconnect; frames / rate should equal the stream
+duration — if it is short, audio was dropped.
+
+Note that killing a side with SIGTERM (including `timeout`) skips its summary, so
+let the *receiver* close the connection if you want the sender's totals.
+
+On Windows the requested rate and channel count are ignored: shared-mode WASAPI does
+not negotiate, so the endpoint's real mix format is detected and reported. If the
+output is set to 5.1 the send is refused rather than mislabelled — set it to stereo.
+
 
 On **Windows** (the receiver), start it first so the port is listening:
 

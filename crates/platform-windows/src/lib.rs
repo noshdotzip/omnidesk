@@ -19,6 +19,7 @@ pub mod cursor;
 pub mod hook;
 pub mod hotkey;
 pub mod inject;
+pub mod loopback;
 
 #[cfg(windows)]
 mod windows_impl;
