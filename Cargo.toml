@@ -12,6 +12,7 @@ members = [
     "crates/platform-windows",
     "crates/platform-linux",
     "crates/agent",
+    "apps/control",
 ]
 
 [workspace.package]

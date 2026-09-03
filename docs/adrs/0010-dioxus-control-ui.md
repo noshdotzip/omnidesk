@@ -1,6 +1,6 @@
 # ADR-0010: Dioxus for the control UI
 
-- Status: **Proposed** (requested 2026-09-03; not implemented)
+- Status: **Accepted** for the control UI (prototyped and running 2026-09-03)
 - Date: 2026-09-03
 
 ## Context
@@ -32,7 +32,34 @@ Marked Proposed rather than Accepted because it has not been prototyped, and bec
 deliberately introduces a second UI stack. That cost is real and should be paid with
 eyes open, not discovered later.
 
-## Open questions to settle before accepting
+## What the prototype settled
+
+A working display-arrangement editor now exists (`apps/control`), so two of the four
+questions below are answered by measurement rather than argument.
+
+**Windows ARM64 (question 3): confirmed native.** `dioxus 0.6` with the `desktop`
+feature builds for `aarch64-pc-windows-msvc` and runs — a real window, correct title,
+no stderr. ADR-0008 is satisfied; nothing here runs under Prism.
+
+Building it did expose that the Windows toolchain was still on rustc 1.86 while the
+Arch box was on 1.98. A transitive dependency requires 1.88, so the workspace would
+not build until `rustup update stable` brought Windows to 1.98.1. The whole workspace
+passes clippy `-D warnings` on the newer compiler.
+
+**Renderer (question 2): it is the WebView.** The build pulls `webview2-com` and
+`tao`, so Dioxus Desktop is Chromium-via-WebView2 on Windows. That is the footprint
+concern this ADR raised, and it is real: choosing Dioxus does not avoid shipping a
+browser engine, it swaps Electron's bundled one for the system one. What it does buy
+is a Rust-native UI that shares `ultidesk-topology` directly, with no IPC or
+duplicated geometry between the editor and the agent.
+
+**Not yet verified: the Linux build.** Dioxus Desktop uses `wry`/`webkit2gtk` there,
+which needs `webkit2gtk-4.1` development headers. Whether the Arch box has them is
+unchecked — it went offline mid-session. If they are absent this is a second
+toolchain dependency to install, and it should be recorded here before the ADR is
+treated as settled on Linux.
+
+## Open questions still outstanding
 
 1. **Two UI stacks, or eventually one?** If Dioxus proves sufficient, does the
    projection window migrate to it too, retiring Electron? That depends on whether a
@@ -41,9 +68,7 @@ eyes open, not discovered later.
 2. **Which Dioxus renderer?** Desktop (WebView) reintroduces a browser engine and much
    of the footprint Electron was being avoided for; Blitz is native but far less mature.
    The choice materially changes the footprint argument.
-3. **Windows ARM64.** Ultidesk is native-only on ARM64 (ADR-0008). Whichever renderer is
-   chosen must have a genuinely native aarch64 build, and any native dependency it pulls
-   in has to be checked the same way esbuild and rollup were.
+3. ~~**Windows ARM64.**~~ Answered above: native, verified running.
 4. **IPC shape.** The control UI mutates state the Rust agent owns. It should speak the
    existing IPC protocol rather than growing a parallel one — see ADR-0004 on keeping a
    single protocol schema.
