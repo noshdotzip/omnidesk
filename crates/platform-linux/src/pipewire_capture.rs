@@ -175,6 +175,121 @@ mod imp {
         )
     }
 
+    /// `DRM_FORMAT_MOD_INVALID` — "whatever the driver picks implicitly".
+    ///
+    /// Offering this rather than an enumerated modifier list avoids having to stand up
+    /// EGL/GBM just to ask the GPU what it supports. The compositor is free to answer
+    /// with its own modifier because the property is DONT_FIXATE.
+    const DRM_FORMAT_MOD_INVALID: i64 = 0x00ff_ffff_ffff_ffff;
+    const DRM_FORMAT_MOD_LINEAR: i64 = 0;
+
+    fn id_choice(default: u32, alternatives: Vec<u32>) -> Value {
+        Value::Choice(spa::pod::ChoiceValue::Id(spa::utils::Choice(
+            spa::utils::ChoiceFlags::empty(),
+            spa::utils::ChoiceEnum::Enum {
+                default: spa::utils::Id(default),
+                alternatives: alternatives.into_iter().map(spa::utils::Id).collect(),
+            },
+        )))
+    }
+
+    fn size_choice() -> Value {
+        Value::Choice(spa::pod::ChoiceValue::Rectangle(spa::utils::Choice(
+            spa::utils::ChoiceFlags::empty(),
+            spa::utils::ChoiceEnum::Range {
+                default: spa::utils::Rectangle {
+                    width: 1920,
+                    height: 1080,
+                },
+                min: spa::utils::Rectangle {
+                    width: 1,
+                    height: 1,
+                },
+                max: spa::utils::Rectangle {
+                    width: 8192,
+                    height: 8192,
+                },
+            },
+        )))
+    }
+
+    fn framerate_choice() -> Value {
+        Value::Choice(spa::pod::ChoiceValue::Fraction(spa::utils::Choice(
+            spa::utils::ChoiceFlags::empty(),
+            spa::utils::ChoiceEnum::Range {
+                default: spa::utils::Fraction { num: 60, denom: 1 },
+                min: spa::utils::Fraction { num: 0, denom: 1 },
+                max: spa::utils::Fraction { num: 240, denom: 1 },
+            },
+        )))
+    }
+
+    /// An EnumFormat that also carries a DRM modifier, which is what makes a
+    /// compositor willing to hand back DMA-BUF.
+    ///
+    /// Advertising `SPA_PARAM_BUFFERS_dataType` is necessary but not sufficient:
+    /// measured against KWin, a format with no modifier property allocates shared
+    /// memory every time. The modifier must be MANDATORY (the compositor may not
+    /// silently drop it) and DONT_FIXATE (we accept whichever modifier it chooses).
+    ///
+    /// Offered *alongside* the plain format rather than instead of it, so a compositor
+    /// or GPU that cannot do DMA-BUF still negotiates the shared-memory path instead
+    /// of failing outright. Slower is acceptable; not working is not.
+    fn format_pod_with_modifier() -> Result<Vec<u8>, CaptureError> {
+        use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
+        use spa::param::video::VideoFormat;
+        use spa::pod::{Property, PropertyFlags};
+
+        let obj = spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+            id: spa::param::ParamType::EnumFormat.as_raw(),
+            properties: vec![
+                Property::new(
+                    FormatProperties::MediaType.as_raw(),
+                    Value::Id(spa::utils::Id(MediaType::Video.as_raw())),
+                ),
+                Property::new(
+                    FormatProperties::MediaSubtype.as_raw(),
+                    Value::Id(spa::utils::Id(MediaSubtype::Raw.as_raw())),
+                ),
+                Property::new(
+                    FormatProperties::VideoFormat.as_raw(),
+                    id_choice(
+                        VideoFormat::BGRx.as_raw(),
+                        vec![
+                            VideoFormat::BGRx.as_raw(),
+                            VideoFormat::BGRA.as_raw(),
+                            VideoFormat::RGBx.as_raw(),
+                            VideoFormat::RGBA.as_raw(),
+                        ],
+                    ),
+                ),
+                Property {
+                    key: FormatProperties::VideoModifier.as_raw(),
+                    flags: PropertyFlags::MANDATORY | PropertyFlags::DONT_FIXATE,
+                    value: Value::Choice(spa::pod::ChoiceValue::Long(spa::utils::Choice(
+                        spa::utils::ChoiceFlags::empty(),
+                        spa::utils::ChoiceEnum::Enum {
+                            default: DRM_FORMAT_MOD_INVALID,
+                            alternatives: vec![DRM_FORMAT_MOD_INVALID, DRM_FORMAT_MOD_LINEAR],
+                        },
+                    ))),
+                },
+                Property::new(FormatProperties::VideoSize.as_raw(), size_choice()),
+                Property::new(
+                    FormatProperties::VideoFramerate.as_raw(),
+                    framerate_choice(),
+                ),
+            ],
+        };
+        Ok(
+            PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+                .map_err(pwerr)?
+                .0
+                .into_inner(),
+        )
+    }
+
     /// The EnumFormat pod every stream offers.
     fn format_pod() -> Result<Vec<u8>, CaptureError> {
         let obj = pw::spa::pod::object!(
@@ -395,9 +510,18 @@ mod imp {
                 .register()
                 .map_err(pwerr)?;
 
-            let values = format_pod()?;
-            let mut params = [Pod::from_bytes(&values)
-                .ok_or_else(|| CaptureError::PipeWire("could not build the format pod".into()))?];
+            // Order matters: the compositor takes the first format it can satisfy, so
+            // the DMA-BUF-capable one goes first and the plain one is the fallback.
+            let with_mod = format_pod_with_modifier()?;
+            let plain = format_pod()?;
+            let mut params = [
+                Pod::from_bytes(&with_mod).ok_or_else(|| {
+                    CaptureError::PipeWire("could not build the modifier format pod".into())
+                })?,
+                Pod::from_bytes(&plain).ok_or_else(|| {
+                    CaptureError::PipeWire("could not build the format pod".into())
+                })?,
+            ];
 
             stream
                 .connect(

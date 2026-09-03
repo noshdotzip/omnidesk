@@ -190,9 +190,44 @@ on-screen capture indicators, named-pipe ACL hardening.
    read them yet — that needs the GUI. A software OpenH264 fallback on ARM64 would be a
    serious performance bug and is the first thing to check once the GUI runs.
 
+## Verified: zero-copy video capture (2026-09-03)
+
+`ultidesk-agent cast-test start` against KDE Plasma 6.7.2:
+
+```
+node 103: frames=1 size=800x628 max_fps=144 dma-buf=1 mapped=0
+  allocated DmaBuf — zero-copy capable
+```
+
+Getting there needed all three of these, and each was necessary but not sufficient
+on its own — each was measured, not assumed:
+
+1. **Do not set `StreamFlags::MAP_BUFFERS`.** It forces PipeWire to mmap every
+   buffer, which defeats DMA-BUF outright. Removing it alone changed nothing.
+2. **Advertise `SPA_PARAM_BUFFERS_dataType`** as a single combined bitmask including
+   `SPA_DATA_DmaBuf`. Encoding it as enumerated alternatives instead produces
+   `error alloc buffers: Invalid argument` and a stream that negotiates a format and
+   then never allocates a buffer. Still yielded shared memory once fixed.
+3. **Negotiate a DRM modifier.** `SPA_FORMAT_VIDEO_modifier`, MANDATORY and
+   DONT_FIXATE, offering `DRM_FORMAT_MOD_INVALID`. This is the step that actually
+   flips KWin to DMA-BUF.
+
+The modifier-bearing format is offered *alongside* the plain one, so a compositor or
+GPU that cannot do DMA-BUF still negotiates shared memory rather than failing. Slower
+is acceptable; not working is not.
+
+Buffer kind is read from the `add_buffer` callback, which fires at allocation before
+any frame. That matters because compositors send frames on damage rather than on a
+clock, so a static window produces none — and without this, "nothing moved" and
+"negotiation failed" look identical.
+
 ## Blocked
 
-- **PipeWire video capture needs `clang` installed on the Arch box.** The ScreenCast
+- ~~PipeWire video capture needs `clang`~~ — **resolved**: clang was installed, and
+  `pipewire 0.10` (not 0.8, which fails against PipeWire 1.6.7 because bindgen emits
+  `spa_pod_builder` as an opaque type) builds cleanly. Kept here only as the record of
+  what the blocker was.
+- **Historic:** PipeWire video capture needed `clang` on the Arch box. The ScreenCast
   portal is complete — `cast-test start` returns a real node id, a restore token and
   an authorised PipeWire fd — but turning that fd into frames needs a PipeWire
   client, and every route is closed on this machine:
