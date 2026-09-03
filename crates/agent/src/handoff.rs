@@ -16,6 +16,18 @@
 //! 3. **Peer loss**, and **a hard deadline**. Any send/receive failure releases, and the
 //!    session ends after a fixed time regardless.
 //!
+//! # Applications that own the pointer
+//! A first-person game, or anything else holding the cursor, is polled for via
+//! `ClipCursor` and suspends crossing while the lock is held: reaching the screen edge
+//! there is aiming, not a request to switch machines, and handing off would rip the
+//! operator out of the game mid-motion. Releasing the lock does not immediately re-arm
+//! either, because games commonly let the cursor go wherever it happens to be — which
+//! may be the crossing edge.
+//!
+//! The converse case, a *remote* application locking the pointer while control is on
+//! the peer, is not handled yet: it needs the peer to report the lock so this side can
+//! switch from absolute positions to relative deltas.
+//!
 //! # Why the cursor gets re-anchored
 //! Swallowing `WM_MOUSEMOVE` stops the cursor moving, so its absolute position stops
 //! advancing and would pin the remote pointer at the edge. Motion is instead recovered
@@ -31,7 +43,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use ultidesk_core::kvm::{KvmEvent, KvmMachine, KvmOutcome};
 use ultidesk_platform_windows::cursor::{
-    at_right_edge, set_cursor_position, vertical_fraction, virtual_screen,
+    at_right_edge, pointer_is_confined, set_cursor_position, vertical_fraction, virtual_screen,
 };
 use ultidesk_platform_windows::hook::{spawn_input_hooks, HookEvent};
 use ultidesk_platform_windows::hotkey::{spawn_emergency_release, EMERGENCY_RELEASE_LABEL};
@@ -105,6 +117,7 @@ pub async fn run(
     let mut remote = (0.0f64, 0.0f64);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let mut forwarded = 0u64;
+    let mut confined = false;
 
     let result = async {
         // One request/response exchange. Any failure propagates and releases the grab.
@@ -123,6 +136,21 @@ pub async fn run(
         }
 
         while std::time::Instant::now() < deadline {
+            // An application owning the pointer (a first-person game, a CAD viewport)
+            // makes edge contact meaningless as a crossing signal — there, moving to
+            // the edge is aiming. Polled rather than event-driven because Win32 offers
+            // no notification when the clip rectangle changes.
+            let now_confined = pointer_is_confined(vs);
+            if now_confined != confined {
+                confined = now_confined;
+                machine.on(KvmEvent::PointerConfined(confined));
+                if confined {
+                    println!("pointer locked by an application — edge crossing suspended");
+                } else {
+                    println!("pointer released — move off the edge to re-arm crossing");
+                }
+            }
+
             // Route 2: the registered hotkey (only reachable when not swallowing keys).
             if hotkey_rx.try_recv().is_ok() {
                 if let KvmOutcome::Released(reason) = machine.on(KvmEvent::EmergencyRelease) {

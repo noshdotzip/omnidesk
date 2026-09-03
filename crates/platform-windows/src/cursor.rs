@@ -62,10 +62,10 @@ pub fn virtual_screen() -> Option<VirtualScreen> {
 #[cfg(windows)]
 mod imp {
     use super::*;
-    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Foundation::{POINT, RECT};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        GetClipCursor, GetCursorPos, GetSystemMetrics, SetCursorPos, SM_CXVIRTUALSCREEN,
+        SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     };
 
     pub fn cursor_position() -> Option<(i32, i32)> {
@@ -73,6 +73,13 @@ mod imp {
         // SAFETY: `p` is a valid, writable POINT for the duration of the call.
         unsafe { GetCursorPos(&mut p) }.ok()?;
         Some((p.x, p.y))
+    }
+
+    pub fn cursor_clip() -> Option<(i32, i32, i32, i32)> {
+        let mut r = RECT::default();
+        // SAFETY: `r` is a valid, writable RECT for the duration of the call.
+        unsafe { GetClipCursor(&mut r) }.ok()?;
+        Some((r.left, r.top, r.right, r.bottom))
     }
 
     pub fn set_cursor_position(x: i32, y: i32) -> bool {
@@ -102,6 +109,53 @@ mod imp {
             height,
         })
     }
+}
+
+/// The rectangle the pointer is currently confined to, as `(left, top, right, bottom)`.
+///
+/// When nothing has confined it this equals the virtual screen, so the caller compares
+/// against that rather than looking for a sentinel.
+pub fn cursor_clip() -> Option<(i32, i32, i32, i32)> {
+    #[cfg(windows)]
+    {
+        imp::cursor_clip()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Whether an application has confined the pointer to a region smaller than the desktop.
+///
+/// Used to suppress KVM edge crossing: inside a game that owns the pointer, moving to
+/// the screen edge is aiming, not a request to switch machines.
+///
+/// # What this does and does not catch
+/// This detects `ClipCursor`-style confinement, which is what windowed and borderless
+/// games typically use. It does **not** detect a game that leaves the cursor unclipped
+/// and instead consumes raw input while re-centring the pointer itself — there is no
+/// Win32 query for "is someone else reading raw input". Such an app is still handled,
+/// but by a different mechanism: it keeps the pointer near the window centre, so it
+/// never reaches the crossing edge in the first place. Treat this as one signal, not a
+/// complete answer.
+pub fn pointer_is_confined(vs: VirtualScreen) -> bool {
+    match cursor_clip() {
+        Some(clip) => is_confining(clip, vs),
+        None => false,
+    }
+}
+
+/// Whether a clip rectangle is narrower than the whole virtual desktop.
+///
+/// Pure, so it is tested everywhere. Compared with a one-pixel tolerance because the
+/// unconfined clip rect is reported as the virtual screen and an exact-equality check
+/// is needlessly brittle across DPI rounding.
+pub fn is_confining(clip: (i32, i32, i32, i32), vs: VirtualScreen) -> bool {
+    let (left, top, right, bottom) = clip;
+    let clip_w = right - left;
+    let clip_h = bottom - top;
+    clip_w < vs.width - 1 || clip_h < vs.height - 1
 }
 
 /// Whether a point sits on the given edge of a virtual screen, within `slop` pixels.
@@ -204,5 +258,46 @@ mod tests {
             height: 1,
         };
         assert_eq!(vertical_fraction(0, vs), 0.0);
+    }
+    #[test]
+    fn an_unconfined_clip_equals_the_desktop_and_is_not_confining() {
+        // Windows reports the full virtual screen when nothing has clipped the
+        // pointer, so the common case must not read as a lock.
+        assert!(!is_confining((0, 0, 1920, 1080), VS));
+    }
+
+    #[test]
+    fn a_window_sized_clip_is_confining() {
+        // What a windowed first-person game looks like.
+        assert!(is_confining((100, 100, 1000, 700), VS));
+    }
+
+    #[test]
+    fn a_clip_narrow_in_only_one_axis_still_counts() {
+        // Full height but half width, e.g. a side-by-side viewport.
+        assert!(is_confining((0, 0, 960, 1080), VS));
+        assert!(is_confining((0, 0, 1920, 540), VS));
+    }
+
+    #[test]
+    fn a_fullscreen_game_clip_is_not_mistaken_for_confinement() {
+        // A borderless fullscreen app clips to the whole screen. That is not a lock
+        // that should suppress crossing, or edge handoff would never work on a
+        // single-monitor desk with any fullscreen window focused.
+        assert!(!is_confining((0, 0, 1920, 1080), VS));
+    }
+
+    #[test]
+    fn confinement_is_measured_against_the_actual_desktop_not_zero_origin() {
+        let vs = VirtualScreen {
+            left: -1920,
+            top: 0,
+            width: 3840,
+            height: 1080,
+        };
+        // Clipped to just the left monitor: confining on a 3840-wide desktop.
+        assert!(is_confining((-1920, 0, 0, 1080), vs));
+        // Clipped to the whole span: not confining.
+        assert!(!is_confining((-1920, 0, 1920, 1080), vs));
     }
 }
