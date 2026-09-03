@@ -49,7 +49,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -223,12 +223,24 @@ fn cast_test() -> Result<()> {
     let session = ScreenCastSession::open()?;
     eprintln!("CreateSession OK");
 
+    // multiple: true asks the compositor for a multi-select picker, so one dialog can
+    // authorise a whole working set of windows. Each still arrives as its own node and
+    // is composited separately, so occlusion never matters.
     let opts = CastOptions {
         cursor: CursorMode::best_available(cursor_bits).unwrap_or(CursorMode::Embedded),
+        multiple: true,
         ..CastOptions::default()
     };
+    // 'cast-test pick' deliberately ignores any stored grant so the picker reappears.
+    // Without this the token pins the selection and there is no way to choose a
+    // different window, which is a dead end rather than a security property.
+    let force_pick = std::env::args().nth(2).as_deref() == Some("pick");
     let grant = CastGrant {
-        restore_token: std::env::var("ULTIDESK_CAST_TOKEN").ok(),
+        restore_token: if force_pick {
+            None
+        } else {
+            std::env::var("ULTIDESK_CAST_TOKEN").ok()
+        },
     };
     session.select_sources(opts, &grant)?;
     eprintln!(
@@ -238,14 +250,22 @@ fn cast_test() -> Result<()> {
     );
 
     // Start opens the compositor's picker, so it only runs when explicitly asked for.
-    if std::env::args().nth(2).as_deref() != Some("start") {
+    let go = matches!(
+        std::env::args().nth(2).as_deref(),
+        Some("start") | Some("pick")
+    );
+    if !go {
         session.close()?;
         println!("screencast negotiation reached Start-ready state");
-        println!("run 'cast-test start' to open the picker and obtain a PipeWire node");
+        println!("run 'cast-test start' to capture, or 'cast-test pick' to choose windows afresh");
         return Ok(());
     }
 
-    eprintln!("KDE will ask which window to share — pick one to continue.");
+    if force_pick {
+        eprintln!("KDE will ask which windows to share — select as many as you want.");
+    } else {
+        eprintln!("KDE will ask which windows to share unless a stored grant applies.");
+    }
     let started = session.start()?;
     if started.nodes.is_empty() {
         anyhow::bail!("the compositor granted no streams");
@@ -261,30 +281,58 @@ fn cast_test() -> Result<()> {
     }
 
     let fd = session.open_pipewire_remote()?;
-    let node = started.nodes[0];
-    println!("connecting to pipewire node {node} ...");
+    println!(
+        "capturing {} window(s) concurrently, one stream each ...",
+        started.nodes.len()
+    );
 
-    let report = ultidesk_platform_linux::pipewire_capture::capture(
+    let reports = ultidesk_platform_linux::pipewire_capture::capture_nodes(
         fd,
-        node,
+        &started.nodes,
         120,
         std::time::Duration::from_secs(10),
     )?;
 
-    println!(
-        "frames={} size={}x{} max_fps={}",
-        report.frames, report.width, report.height, report.max_framerate
-    );
-    println!(
-        "  dma-buf frames={}  mapped-memory frames={}",
-        report.dma_buf_frames, report.mem_ptr_frames
-    );
-    if report.frames == 0 {
-        println!("  NO FRAMES: the node produced nothing before the timeout");
-    } else if report.used_zero_copy() {
-        println!("  zero-copy path in use (DMA-BUF) — importable into a hardware encoder");
+    let mut any_frames = false;
+    let mut all_zero_copy = true;
+    for r in &reports {
+        println!(
+            "  node {}: frames={} size={}x{} max_fps={} dma-buf={} mapped={}",
+            r.node_id,
+            r.frames,
+            r.width,
+            r.height,
+            r.max_framerate,
+            r.dma_buf_frames,
+            r.mem_ptr_frames
+        );
+        // Reported independently of frame count: buffers are allocated before any
+        // frame arrives, so this answers "did zero copy negotiate?" even for a window
+        // that never changes.
+        match r.allocated {
+            Some(k) if r.negotiated_dma_buf() => {
+                println!("    allocated {k:?} — zero-copy capable")
+            }
+            Some(k) => println!("    allocated {k:?} — NOT zero-copy capable"),
+            None => println!("    no buffers were allocated"),
+        }
+        if r.saw_frames() {
+            any_frames = true;
+            if !r.used_zero_copy() {
+                all_zero_copy = false;
+            }
+        } else {
+            // Not a failure: compositors send frames on damage, so a window nobody is
+            // touching legitimately produces none.
+            println!("    (no frames — that window did not change during the run)");
+        }
+    }
+    if !any_frames {
+        println!("  NO FRAMES from any node: move or resize a captured window and retry");
+    } else if all_zero_copy {
+        println!("  zero-copy (DMA-BUF) — importable into a hardware encoder");
     } else {
-        println!("  NOT zero-copy: frames arrived as mapped memory, costing a readback each");
+        println!("  NOT zero-copy: mapped memory, costing a GPU readback per frame");
     }
 
     session.close()?;

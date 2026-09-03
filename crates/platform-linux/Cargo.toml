@@ -23,3 +23,7 @@ zbus = { version = "5", default-features = false, features = ["async-io", "block
 # Native PipeWire client. 0.10 is the first release that builds against PipeWire 1.6:
 # libspa 0.8 fails there because bindgen emits spa_pod_builder as an opaque type.
 pipewire = "0.10"
+# Raw SPA constants. libspa exposes typed helpers for format params but not for
+# SPA_PARAM_BUFFERS_dataType, and hardcoding an ABI constant is how a silent
+# mis-negotiation gets introduced.
+libspa-sys = "0.10"
