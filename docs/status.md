@@ -190,6 +190,28 @@ on-screen capture indicators, named-pipe ACL hardening.
    read them yet — that needs the GUI. A software OpenH264 fallback on ARM64 would be a
    serious performance bug and is the first thing to check once the GUI runs.
 
+## Blocked
+
+- **PipeWire video capture needs `clang` installed on the Arch box.** The ScreenCast
+  portal is complete — `cast-test start` returns a real node id, a restore token and
+  an authorised PipeWire fd — but turning that fd into frames needs a PipeWire
+  client, and every route is closed on this machine:
+  - `pipewire-rs` fails to build: `libspa-sys` runs bindgen, which panics with
+    "Unable to find libclang". `clang` and `libclang.so` are absent (verified by
+    building the crate, not just by probing).
+  - GStreamer is installed but has neither `pipewiresrc` nor **any** H.264 encoder
+    (`x264enc`, `vah264enc`, `vaapih264enc`, `openh264enc` all absent), so the CLI
+    shim that worked for audio is not available for video.
+  - `libpipewire-0.3` (1.6.7) and `libspa-0.2` headers *are* present, and VAAPI
+    hardware exists (`/dev/dri/renderD128`), so only the toolchain is missing.
+
+  Unblock with `sudo pacman -S clang` (and `gst-plugins-good`/`gstreamer-vaapi` if
+  the CLI route is preferred later). Installing needs a password, so it cannot be
+  done unattended.
+
+  Note `reis` (the pure-Rust libei client, needed for InputCapture event delivery)
+  builds fine without clang — only the video path is blocked.
+
 ## Planned / requested work
 
 - **Dioxus control UI** — topology editor (dragging monitor rectangles into their
