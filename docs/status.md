@@ -68,6 +68,16 @@ KDE Plasma Wayland session.
   fires and there is no error to chase. **The D-Bus session for InputCapture is not
   written yet**, and even once it is, actual event delivery needs a libei client
   (`ConnectToEIS` + the `reis` crate). No input has been captured.
+- **Audio routing works, Arch -> Windows** (verified 2026-09-03). `audio-send` on
+  Arch captures a PipeWire sink's *monitor* via `pw-record` and streams raw s16le
+  PCM; `audio-recv` on Windows plays it through WASAPI (cpal). Measured: 1.4 MB /
+  351,232 frames over an 8s run = 7.3s of audio at 48 kHz stereo, which is the
+  stream duration, so nothing was dropped or misaligned. Clean disconnect.
+  **Not confirmed audible**: the Arch box may have been playing silence, and nobody
+  was listening on the Windows end. The byte and frame accounting proves the path,
+  not the sound.
+  Uncompressed, so it needs ~1.5 Mbit/s — fine on the measured 167+ Mbit/s LAN.
+  Windows -> Arch is not implemented (needs WASAPI loopback capture).
 - **KVM handoff implemented, NOT yet run on real hardware** (`kvm-handoff`). Grabs
   the local pointer with a `WH_MOUSE_LL` hook when it reaches the right edge and
   forwards motion to the peer. Built on `core::kvm` (10 tests pinning that every

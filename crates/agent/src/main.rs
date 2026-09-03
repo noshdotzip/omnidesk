@@ -14,6 +14,7 @@
 //!                              pointer, to prove input injection works. Linux only.
 //!                              DOES prompt for permission and DOES move the cursor.
 
+mod audio;
 mod endpoint;
 #[cfg(windows)]
 mod handoff;
@@ -42,11 +43,13 @@ fn main() -> Result<()> {
         "kvm-demo" => kvm_demo(),
         "kvm-mirror" => kvm_mirror(),
         "kvm-handoff" => kvm_handoff(),
+        "audio-send" => audio_send(),
+        "audio-recv" => audio_recv(),
         "serve" => serve(),
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff]"
+                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -369,6 +372,49 @@ fn kvm_handoff() -> Result<()> {
     anyhow::bail!(
         "kvm-handoff needs Windows low-level input hooks; the Linux source side needs libei"
     )
+}
+
+/// Stream this machine's audio output to a peer (Linux/PipeWire source side).
+fn audio_send() -> Result<()> {
+    let addr = std::env::args().nth(2).ok_or_else(|| {
+        anyhow::anyhow!("usage: audio-send <host:port> <pipewire-target> [rate] [channels]")
+    })?;
+    let target = std::env::args().nth(3).ok_or_else(|| {
+        anyhow::anyhow!("usage: audio-send <host:port> <pipewire-target> [rate] [channels]")
+    })?;
+    let rate: u32 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48_000);
+    let channels: u16 = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(audio::send(
+        &addr,
+        &target,
+        audio::AudioFormat { rate, channels },
+    ))
+}
+
+/// Play a peer's audio on this machine (Windows/WASAPI receiving side).
+fn audio_recv() -> Result<()> {
+    let bind = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "0.0.0.0:45873".to_string());
+    // 120ms of slack by default: enough to ride out WiFi jitter (measured 15ms mean
+    // absolute deviation on this link) without a audible lag.
+    let latency: f64 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120.0);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(audio::recv(&bind, latency))
 }
 
 #[cfg(windows)]

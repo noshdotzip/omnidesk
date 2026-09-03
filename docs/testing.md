@@ -56,6 +56,32 @@ and a renderer bundling step (Vite) that is the next task. Once bundling is wire
 Record results in [compatibility.md](compatibility.md). Until these are run, the
 projection capability stays "Untested".
 
+## Manual test: audio routing (Arch -> Windows)
+
+On **Windows** (the receiver), start it first so the port is listening:
+
+```bash
+./target/debug/ultidesk-agent.exe audio-recv 0.0.0.0:45873 120
+```
+
+On **Arch**, find a sink and stream its monitor — the monitor of an *output*, so what
+the machine is playing, not a microphone:
+
+```bash
+pw-cli ls Node | grep -B2 'Audio/Sink'
+./target/debug/ultidesk-agent audio-send <windows-ip>:45873 <sink-name>.monitor 48000 2
+```
+
+Play something on Arch and it should come out of the Windows speakers. The receiver
+prints bytes and frames on disconnect; frames / rate should equal the stream
+duration — if it is short, audio was dropped.
+
+The last argument to `audio-recv` is the latency cap in milliseconds. Lower it for
+tighter sync, raise it if the audio breaks up: the measured WiFi link has ~15 ms mean
+absolute jitter, so a cap below about 50 ms will glitch on it.
+
+Capturing the sink itself rather than its `.monitor` silently sends the wrong thing.
+
 ## Manual test: KVM handoff (Windows ARM64 -> Arch Wayland)
 
 **This grabs your pointer.** While control is on the peer, the Windows cursor stops
