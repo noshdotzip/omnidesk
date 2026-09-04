@@ -80,3 +80,10 @@ treated as settled on Linux.
 - Two UI toolchains must be built, tested and shipped on both platforms until (1) is
   resolved.
 - Nothing here changes the media plane: ADR-0003 (WebRTC) stands.
+- **Linux picks up an X11 dependency.** `tao` pulls in `muda` for menus, and
+  `libxdo-sys` emits `cargo:rustc-link-lib=xdo` unconditionally, so the control app
+  will not link on Linux without `xdotool` installed (69 KiB). This is an X11
+  automation library being linked into a Wayland application; it works under XWayland
+  and costs nothing at runtime, but it is a real dependency the Electron path did not
+  have, and worth naming rather than discovering at packaging time. Found 2026-09-04
+  when the app first built against Arch — Windows had never surfaced it.

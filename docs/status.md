@@ -1,6 +1,6 @@
 # Ultidesk status
 
-Honest snapshot of what is built, verified, and not. Updated 2026-07-31.
+Honest snapshot of what is built, verified, and not. Updated 2026-09-04.
 
 ## Milestone position
 
@@ -221,6 +221,34 @@ any frame. That matters because compositors send frames on damage rather than on
 clock, so a static window produces none — and without this, "nothing moved" and
 "negotiation failed" look identical.
 
+## Verified: control UI — display arrangement and audio routing (2026-09-04)
+
+Built with Dioxus 0.6 desktop ([ADR-0010](adrs/0010-dioxus-control-ui.md)) and running
+**natively** on `aarch64-pc-windows-msvc`; the renderer is WebView2, confirmed by the
+`webview2-com` dependency rather than assumed.
+
+- `cargo test --workspace` -> **188 tests pass** on Windows ARM64 and on Arch x64.
+  Clippy `-D warnings` and `cargo fmt --check` clean on both.
+- **Display arrangement**: monitors drag and snap; overlaps are flagged; shared borders
+  are listed. All geometry comes from `ultidesk-topology::layout` so the editor cannot
+  disagree with the agent. Verified on screen that a 1109-tall and a 1080-tall monitor
+  report **1080px** of shared border — the overlapping-span rule, not the taller edge.
+- **Audio device enumeration**, native on both platforms
+  ([ADR-0011](adrs/0011-audio-routing-loop-prevention.md)): 6 endpoints on Arch via the
+  PipeWire registry (4 sinks, 2 sources, correct defaults) and 2 on Windows ARM64 via
+  WASAPI. Exposed as `ultidesk-agent audio-devices`.
+- The Linux walk needs **two** `sync` round-trips, measured rather than assumed: with
+  one, 0 of 6 devices come back marked default; with two, the correct 2 do.
+- **Feedback-loop refusal verified end-to-end in the UI**: selecting the same output as
+  both source and sink disables "Add route" and explains why, naming the device rather
+  than its GUID.
+
+Not verified: the control app does **not** build on Linux yet — `muda` (pulled in by
+`tao`) links `libxdo` unconditionally, and `xdotool` is not installed on the Arch box
+(69 KiB download; needs a sudo password). Nothing else in the workspace is affected.
+The panel also cannot read a *peer's* devices — that needs the settings IPC — and says
+so rather than showing a placeholder.
+
 ## Blocked
 
 - ~~PipeWire video capture needs `clang`~~ — **resolved**: clang was installed, and
@@ -249,20 +277,21 @@ clock, so a static window produces none — and without this, "nothing moved" an
 
 ## Planned / requested work
 
-- **Dioxus control UI** — topology editor (dragging monitor rectangles into their
-  virtual arrangement), cursor settings, audio routing and speaker selection,
-  per-peer permissions, pairing. Requested 2026-09-03; see
-  [ADR-0010](adrs/0010-dioxus-control-ui.md), recorded as Proposed rather than
-  Accepted because it adds a second UI stack alongside Electron and the renderer
-  choice is unresolved. Visual reference: the Kopuz music player's Dioxus UI (not
-  yet reviewed — confirm the repository before treating it as a spec).
+- **Dioxus control UI** — *partly built*, see the verified section above. The
+  display-arrangement editor and the audio-routing panel exist and run natively on
+  Windows ARM64. Still to do: cursor settings, per-peer permissions, pairing, and
+  loading/persisting real state instead of an in-memory layout — all of which need
+  the settings IPC surface. Visual reference: the Kopuz music player's Dioxus UI
+  (not yet reviewed — confirm the repository before treating it as a spec).
 - **libei client** (`reis`) so InputCapture actually delivers events; the portal
   arbitrates capture, it does not carry input.
 - **PipeWire client** so ScreenCast's `OpenPipeWireRemote` fd becomes video frames.
 - **Peer transport** (Milestone 1) — without it nothing crosses machines regardless
   of how well either backend works.
-- **Audio routing** — PipeWire `rtp-sink`/`rtp-source` already present on the Arch
-  box; the one goal needing no portal permission.
+- **Audio transport quality** — the routing model and device selection are built
+  (see above), but the stream itself is still uncompressed PCM over plaintext TCP and
+  Linux playback still shells out to `pw-play`. Opus/RTP over the ADR-0002 transport
+  is the target; PipeWire `rtp-sink`/`rtp-source` are present on the Arch box.
 
 ## Exact next step
 
