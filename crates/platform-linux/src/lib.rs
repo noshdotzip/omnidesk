@@ -28,6 +28,7 @@
 
 pub mod audio_devices;
 pub mod caps;
+pub mod ei_client;
 pub mod input_capture;
 pub mod keymap;
 pub mod pipewire_capture;

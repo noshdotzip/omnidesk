@@ -31,3 +31,11 @@ pipewire = { version = "0.10", features = ["v0_3_33"] }
 # SPA_PARAM_BUFFERS_dataType, and hardcoding an ABI constant is how a silent
 # mis-negotiation gets introduced.
 libspa-sys = "0.10"
+# Pure-Rust libei. The C library would need libclang for bindgen and would bring its
+# own event loop into the process; this needs neither. The InputCapture portal only
+# arbitrates capture -- it carries no input events -- so without a libei client the
+# barriers fire and nothing arrives.
+reis = { version = "0.7", features = ["tokio"] }
+# reis' event stream is a `futures::Stream`, and the handshake is async.
+futures-util = "0.3"
+tokio = { version = "1", features = ["net", "rt"] }

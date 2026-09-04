@@ -10,6 +10,9 @@
 //!                              (No IPC, no elevation — a quick feasibility probe.)
 //!   ultidesk-agent probe       Print what the local desktop can actually do, as JSON.
 //!                              Linux only; read-only, raises no permission dialog.
+//!   ultidesk-agent kvm-source  Capture this desktop's input at a screen edge and
+//!                              print the events. Linux only. GRABS INPUT — press Esc
+//!                              to release.
 //!   ultidesk-agent audio-devices Print this machine's audio endpoints as JSON.
 //!                              Read-only; raises no permission dialog on either
 //!                              platform.
@@ -46,6 +49,7 @@ fn main() -> Result<()> {
         "kvm-demo" => kvm_demo(),
         "kvm-mirror" => kvm_mirror(),
         "kvm-handoff" => kvm_handoff(),
+        "kvm-source" => kvm_source(),
         "audio-devices" => audio_devices(),
         "audio-send" => audio_send(),
         "audio-recv" => audio_recv(),
@@ -53,7 +57,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -478,6 +482,98 @@ fn kvm_handoff() -> Result<()> {
     anyhow::bail!(
         "kvm-handoff needs Windows low-level input hooks; the Linux source side needs libei"
     )
+}
+
+/// Capture this desktop's input at a screen edge and print what arrives.
+///
+/// This is the Linux half of the KVM: the machine becomes a *source*, so its pointer
+/// and keyboard can drive a peer. `capture-test` stops after placing barriers because
+/// that much is silent; this one goes all the way — Enable, then ConnectToEIS, then a
+/// libei client on the returned socket.
+///
+/// # This grabs real input
+/// Once capture engages, the compositor routes the pointer and keyboard here instead of
+/// to the desktop. Esc always releases it: that check runs before anything else in the
+/// event loop, so a bug further down cannot strand the operator. Killing the process
+/// also releases capture, because the compositor drops the session with the connection.
+#[cfg(target_os = "linux")]
+fn kvm_source() -> Result<()> {
+    use ultidesk_platform_linux::caps::DeviceTypes;
+    use ultidesk_platform_linux::ei_client::{capture_events, CapturedInput, EiSession};
+    use ultidesk_platform_linux::input_capture::{Edge, InputCaptureSession};
+
+    /// evdev keycode for Esc. Not a keysym: libei reports evdev codes.
+    const KEY_ESC: u32 = 1;
+
+    eprintln!("Opening an InputCapture session (KDE may prompt for permission).");
+    let session = InputCaptureSession::open(DeviceTypes {
+        keyboard: true,
+        pointer: true,
+        touchscreen: false,
+    })?;
+
+    let barriers: Vec<_> = session
+        .zones()
+        .iter()
+        .enumerate()
+        .map(|(i, z)| z.barrier(Edge::Right, i as u32 + 1))
+        .collect();
+    if barriers.is_empty() {
+        anyhow::bail!("compositor offered no zones; cannot place a barrier");
+    }
+    // A rejected barrier is not a D-Bus error: the call succeeds and the edge simply
+    // never fires, so this has to be inspected rather than assumed.
+    let failed = session.set_barriers(&barriers)?;
+    if !failed.is_empty() {
+        anyhow::bail!("compositor rejected barrier ids {failed:?}; capture would never fire");
+    }
+    println!("{} barrier(s) accepted on the right edge", barriers.len());
+
+    session.enable()?;
+    let fd = session.connect_to_eis()?;
+    let ei = EiSession::from_fd(fd)?;
+
+    println!();
+    println!("Capture is ARMED. Push the pointer off the RIGHT edge to engage it.");
+    println!("Press Esc at any time to release input and exit.");
+    println!();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut count: u64 = 0;
+    rt.block_on(capture_events(ei, |event| {
+        // Escape first, before any other handling: this is the operator's way out.
+        if let CapturedInput::Key {
+            keycode: KEY_ESC,
+            pressed: false,
+        } = event
+        {
+            println!("Esc — releasing input");
+            return false;
+        }
+        count += 1;
+        // Motion floods; printing every event makes the interesting ones unreadable.
+        match event {
+            CapturedInput::PointerMotion { .. } | CapturedInput::PointerMotionAbsolute { .. } => {
+                if count % 50 == 0 {
+                    println!("[{count}] {event:?}");
+                }
+            }
+            _ => println!("[{count}] {event:?}"),
+        }
+        true
+    }))?;
+
+    println!("captured {count} event(s)");
+    session.disable()?;
+    session.close()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kvm_source() -> Result<()> {
+    anyhow::bail!("kvm-source drives the XDG InputCapture portal and libei; it is Linux-only")
 }
 
 /// Print the machine's audio endpoints as JSON.

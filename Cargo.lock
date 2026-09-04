@@ -3777,6 +3777,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "reis"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b967ec6489a42067a20724f11987bb96178ea796873cbe1afd25fb93ee6f85f"
+dependencies = [
+ "enumflags2",
+ "futures-util",
+ "log",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
 name = "reqwest"
 version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4898,11 +4911,14 @@ dependencies = [
 name = "ultidesk-platform-linux"
 version = "0.0.1"
 dependencies = [
+ "futures-util",
  "libspa-sys",
  "pipewire",
+ "reis",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tokio",
  "tracing",
  "ultidesk-platform-windows",
  "zbus 5.19.0",
