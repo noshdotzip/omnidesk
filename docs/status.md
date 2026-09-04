@@ -227,7 +227,7 @@ Built with Dioxus 0.6 desktop ([ADR-0010](adrs/0010-dioxus-control-ui.md)) and r
 **natively** on `aarch64-pc-windows-msvc`; the renderer is WebView2, confirmed by the
 `webview2-com` dependency rather than assumed.
 
-- `cargo test --workspace` -> **188 tests pass** on Windows ARM64 and on Arch x64.
+- `cargo test --workspace` -> **233 tests pass** on Windows ARM64 and on Arch x64.
   Clippy `-D warnings` and `cargo fmt --check` clean on both.
 - **Display arrangement**: monitors drag and snap; overlaps are flagged; shared borders
   are listed. All geometry comes from `ultidesk-topology::layout` so the editor cannot
@@ -248,6 +248,56 @@ Not verified: the control app does **not** build on Linux yet — `muda` (pulled
 (69 KiB download; needs a sudo password). Nothing else in the workspace is affected.
 The panel also cannot read a *peer's* devices — that needs the settings IPC — and says
 so rather than showing a placeholder.
+
+## Measured: the network link is the dominant latency cost (2026-09-04)
+
+The two machines talk over a Wi-Fi link (Arch on `wlan0`, 5 GHz, via the Windows
+machine's hosted network at `192.168.137.1`). Earlier work measured its *throughput*
+at 167+ Mbit/s and treated the link as solved. Throughput is the wrong metric for a
+KVM: what the operator feels is round-trip latency, and that turns out to be an order
+of magnitude worse than assumed.
+
+| Windows -> Arch ICMP | min | avg | max |
+| --- | --- | --- | --- |
+| Arch radio idle | 16 ms | ~150 ms | 519 ms |
+| Arch radio kept busy | 5 ms | 20 ms | 42 ms |
+
+The two rows differ only in whether the Arch machine was transmitting at the time.
+Arch -> Windows in the same conditions averages 15 ms, so the penalty is one-directional.
+
+That asymmetry is the signature of **Wi-Fi power save**: `iwconfig` reports
+`Power Management: on`, and a sleeping client cannot receive until it next wakes, so
+inbound packets queue at the access point. It is not signal quality -- the link is
+-42 dBm at 68/70 with a 1.13 Gb/s negotiated rate.
+
+Why it matters more than it looks:
+
+- The old `kvm_mirror`, which waited for each `Injected` acknowledgement before sending
+  the next update, was capped at **1/RTT ~= 7 pointer updates per second** on this link.
+  It was not a demo of a slightly laggy KVM; it was a demo of an unusable one. This is
+  what motivated `PeerSink`, and it makes the pipelining change worth roughly 20x on the
+  achievable update rate here rather than the marginal gain it would be on a wired LAN.
+- Uncompressed PCM audio (1.5 Mbit/s) has no jitter buffer, so 500 ms spikes are
+  audible dropouts. This is a second reason to replace it with Opus/RTP, independent of
+  bandwidth.
+- Any figure quoted for input or projection latency is meaningless until power save is
+  settled, because the link contributes more variance than everything else combined.
+
+**Fix (needs a password, so not applied):**
+
+```
+sudo iw dev wlan0 set power_save off
+```
+
+To make it survive a reboot, a NetworkManager drop-in
+(`/etc/NetworkManager/conf.d/wifi-powersave.conf` with `wifi.powersave = 2`).
+
+The Arch machine also has an idle wired interface (`eno1`, state DOWN). If a cable is
+available, that removes the variable entirely and is worth preferring for any latency
+measurement that is meant to be quoted.
+
+Note `iw` is not installed; the readings above came from `iwconfig` (net-tools) and
+`ping`.
 
 ## Blocked
 
