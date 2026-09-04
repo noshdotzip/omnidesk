@@ -1,23 +1,34 @@
-//! Low-level mouse hook, for KVM handoff.
+//! Low-level mouse and keyboard hooks, for KVM handoff.
 //!
 //! Mirroring a pointer only needs to *read* it. Handoff needs to **take** it: while
-//! control is on the peer, local motion must stop reaching this machine, or the two
-//! cursors move together and the local desktop reacts to input meant for the remote
-//! one. `WH_MOUSE_LL` is the documented way to do that.
+//! control is on the peer, local input must stop reaching this machine.
 //!
-//! # Safety rules this module follows
+//! # The keyboard trap
+//! A `WH_KEYBOARD_LL` hook that swallows a key runs **before** the OS processes
+//! registered hotkeys. So a hook that naively swallows everything also swallows
+//! `Ctrl+Alt+Shift+U` — destroying the emergency release exactly when the operator
+//! needs it, because their keyboard no longer reaches their own machine.
 //!
-//! - **Swallowing is opt-in and externally owned.** The hook consults an
-//!   [`AtomicBool`] the caller controls, so the authority to grab lives with the KVM
-//!   state machine (`ultidesk_core::kvm`) and cannot drift out of sync with it.
-//! - **Default is observe-only.** A freshly installed hook swallows nothing.
+//! This module therefore does two things that are not optional:
+//!
+//! - The emergency combination is **never swallowed**, and is reported as
+//!   [`HookEvent::EmergencyRelease`] so the driver can act on it directly rather than
+//!   relying on the (now unreachable) `RegisterHotKey` path.
+//! - Nothing is swallowed at all while the three modifiers are held together, so no
+//!   future edit to the combination can accidentally trap the operator.
+//!
+//! [`crate::hotkey`] remains registered as a second, independent route: it works when
+//! the keyboard is not being grabbed, and it does not depend on this hook running.
+//!
+//! # Other rules
+//! - **Swallowing is opt-in and externally owned**, via an [`AtomicBool`] the caller
+//!   derives from `ultidesk_core::kvm::KvmMachine`.
 //! - **The callback must be fast.** Windows silently unhooks a low-level hook that
-//!   exceeds `LowLevelHooksTimeout`, so the callback only does a non-blocking send and
-//!   never waits on a socket, a lock held elsewhere, or an allocation-heavy path.
-//! - **Keyboard is not hooked here.** Swallowing the keyboard also swallows the
-//!   operator's way out of a wedged state; the mouse alone is the safer first step, and
-//!   the emergency hotkey (see [`crate::hotkey`]) is delivered by the OS regardless.
+//!   exceeds `LowLevelHooksTimeout`, so callbacks only do a non-blocking send.
+//! - **Injected events are flagged**, so the driver's own cursor re-anchoring warp is
+//!   not mistaken for operator motion.
 
+use crate::inject::MouseButton;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -27,41 +38,57 @@ use thiserror::Error;
 pub enum HookError {
     #[error("low-level input hooks are only available on Windows builds")]
     Unsupported,
-    #[error("could not install the low-level mouse hook: {0}")]
+    #[error("could not install the low-level input hooks: {0}")]
     Install(String),
 }
 
-/// A pointer event observed by the hook, in virtual-desktop coordinates.
+/// What the hooks observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HookedMouse {
-    pub x: i32,
-    pub y: i32,
-    /// Whether this event was swallowed rather than passed to the rest of the system.
-    pub swallowed: bool,
-    /// Whether the OS marked this event as synthesized (`LLMHF_INJECTED`).
-    ///
-    /// Handoff re-anchors the cursor with `SetCursorPos` after every swallowed move, and
-    /// that warp comes straight back through this hook. Without this flag the warp would
-    /// be read as real motion and fed back into the delta, producing a runaway loop.
-    pub injected: bool,
+pub enum HookEvent {
+    Motion {
+        x: i32,
+        y: i32,
+        /// Synthesized by us (`LLMHF_INJECTED`) — the re-anchoring warp, not the operator.
+        injected: bool,
+    },
+    Button {
+        button: MouseButton,
+        down: bool,
+    },
+    /// A key, carried as a PS/2 set-1 scancode because that is what the wire protocol
+    /// and the Windows injector both speak.
+    Key {
+        scancode: u16,
+        /// The scancode arrived with an `0xE0` prefix.
+        extended: bool,
+        down: bool,
+    },
+    /// The operator pressed the emergency release. Never swallowed.
+    EmergencyRelease,
 }
 
-/// Install a low-level mouse hook on a dedicated thread.
+/// Install low-level input hooks on a dedicated thread.
 ///
-/// `swallow` is read on every event: while it is `true` the event is consumed and never
-/// reaches the local desktop. The caller owns that flag and is responsible for clearing
-/// it — see `ultidesk_core::kvm::KvmMachine::grab_active`.
-pub fn spawn_mouse_hook(swallow: Arc<AtomicBool>) -> Result<Receiver<HookedMouse>, HookError> {
+/// `swallow` is read on every event: while true, events are consumed and never reach
+/// the local desktop — except the emergency release, which always passes through. Set
+/// `keyboard` to false to hook the mouse only.
+pub fn spawn_input_hooks(
+    swallow: Arc<AtomicBool>,
+    keyboard: bool,
+) -> Result<Receiver<HookEvent>, HookError> {
     #[cfg(windows)]
     {
-        imp::spawn_mouse_hook(swallow)
+        imp::spawn_input_hooks(swallow, keyboard)
     }
     #[cfg(not(windows))]
     {
-        let _ = swallow;
+        let _ = (swallow, keyboard);
         Err(HookError::Unsupported)
     }
 }
+
+/// Virtual-key code of the emergency-release key, matching [`crate::hotkey`].
+pub const EMERGENCY_VK: u32 = 0x55; // 'U'
 
 #[cfg(windows)]
 mod imp {
@@ -69,68 +96,143 @@ mod imp {
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::{self, Sender};
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG,
-        MSLLHOOKSTRUCT, WH_MOUSE_LL, WM_MOUSEMOVE,
+        CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
+        KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
 
-    // The hook callback is a plain `extern "system" fn` with no user pointer, so its
-    // context has to be thread-local. It lives on the hook thread only, which is also
-    // the only thread the callback ever runs on.
+    const LLMHF_INJECTED: u32 = 0x0000_0001;
+    const LLKHF_EXTENDED: u32 = 0x0000_0001;
+    const LLKHF_INJECTED: u32 = 0x0000_0010;
+    const LLKHF_UP: u32 = 0x0000_0080;
+
     thread_local! {
-        static CTX: std::cell::RefCell<Option<(Sender<HookedMouse>, Arc<AtomicBool>)>> =
+        static CTX: std::cell::RefCell<Option<(Sender<HookEvent>, Arc<AtomicBool>)>> =
             const { std::cell::RefCell::new(None) };
     }
 
+    fn send(ev: HookEvent) -> bool {
+        let mut swallow = false;
+        CTX.with(|c| {
+            if let Some((tx, flag)) = c.borrow().as_ref() {
+                swallow = flag.load(Ordering::Relaxed);
+                let _ = tx.send(ev);
+            }
+        });
+        swallow
+    }
+
+    /// Whether Ctrl, Alt and Shift are all currently held.
+    fn all_modifiers_held() -> bool {
+        // SAFETY: GetAsyncKeyState takes no pointers.
+        unsafe {
+            (GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0
+                && (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0
+                && (GetAsyncKeyState(VK_SHIFT.0 as i32) as u16 & 0x8000) != 0
+        }
+    }
+
     unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        // Negative code means "pass it on without inspecting", per the Win32 contract.
         if code < 0 {
             return CallNextHookEx(None, code, wparam, lparam);
         }
+        let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+        let injected = info.flags & LLMHF_INJECTED != 0;
 
-        let mut swallow_this = false;
-        if wparam.0 as u32 == WM_MOUSEMOVE {
-            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            let x = info.pt.x;
-            let y = info.pt.y;
-            const LLMHF_INJECTED: u32 = 0x0000_0001;
-            let injected = info.flags & LLMHF_INJECTED != 0;
-            CTX.with(|c| {
-                if let Some((tx, swallow)) = c.borrow().as_ref() {
-                    // Never swallow our own re-anchoring warp: consuming it would leave
-                    // the cursor wherever the warp was heading and break the anchor.
-                    swallow_this = !injected && swallow.load(Ordering::Relaxed);
-                    // Non-blocking: a wedged consumer must never stall the hook, or
-                    // Windows unhooks us for exceeding LowLevelHooksTimeout.
-                    let _ = tx.send(HookedMouse {
-                        x,
-                        y,
-                        swallowed: swallow_this,
-                        injected,
-                    });
-                }
-            });
-        }
+        let event = match wparam.0 as u32 {
+            WM_MOUSEMOVE => Some(HookEvent::Motion {
+                x: info.pt.x,
+                y: info.pt.y,
+                injected,
+            }),
+            WM_LBUTTONDOWN => Some(HookEvent::Button {
+                button: MouseButton::Left,
+                down: true,
+            }),
+            WM_LBUTTONUP => Some(HookEvent::Button {
+                button: MouseButton::Left,
+                down: false,
+            }),
+            WM_RBUTTONDOWN => Some(HookEvent::Button {
+                button: MouseButton::Right,
+                down: true,
+            }),
+            WM_RBUTTONUP => Some(HookEvent::Button {
+                button: MouseButton::Right,
+                down: false,
+            }),
+            WM_MBUTTONDOWN => Some(HookEvent::Button {
+                button: MouseButton::Middle,
+                down: true,
+            }),
+            WM_MBUTTONUP => Some(HookEvent::Button {
+                button: MouseButton::Middle,
+                down: false,
+            }),
+            _ => None,
+        };
 
-        if swallow_this {
-            // Non-zero consumes the event: it never reaches the local desktop.
+        let Some(event) = event else {
+            return CallNextHookEx(None, code, wparam, lparam);
+        };
+        let swallow = send(event);
+
+        // Never swallow our own warp: consuming it would strand the cursor mid-warp.
+        if swallow && !injected {
             return LRESULT(1);
         }
         CallNextHookEx(None, code, wparam, lparam)
     }
 
-    pub fn spawn_mouse_hook(swallow: Arc<AtomicBool>) -> Result<Receiver<HookedMouse>, HookError> {
+    unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code < 0 {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let info = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        if info.flags.0 & LLKHF_INJECTED != 0 {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let down = info.flags.0 & LLKHF_UP == 0;
+
+        // The emergency release, and anything else held with all three modifiers, is
+        // passed straight through. This is the one branch that must never be reordered
+        // below the swallow: it is the operator's way out of a grabbed keyboard.
+        if all_modifiers_held() {
+            if down && info.vkCode == EMERGENCY_VK {
+                let _ = send(HookEvent::EmergencyRelease);
+            }
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+
+        let swallow = send(HookEvent::Key {
+            scancode: info.scanCode as u16,
+            extended: info.flags.0 & LLKHF_EXTENDED != 0,
+            down,
+        });
+        if swallow {
+            return LRESULT(1);
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    pub fn spawn_input_hooks(
+        swallow: Arc<AtomicBool>,
+        keyboard: bool,
+    ) -> Result<Receiver<HookEvent>, HookError> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-        let (event_tx, event_rx) = mpsc::channel::<HookedMouse>();
+        let (event_tx, event_rx) = mpsc::channel::<HookEvent>();
 
         std::thread::Builder::new()
-            .name("ultidesk-mouse-hook".into())
+            .name("ultidesk-input-hooks".into())
             .spawn(move || {
                 CTX.with(|c| *c.borrow_mut() = Some((event_tx, swallow)));
 
-                // SAFETY: a valid callback, no module handle needed for a low-level
-                // hook, and thread id 0 installs it globally for this thread's queue.
-                let hook: HHOOK =
+                // SAFETY: valid callbacks; low-level hooks need no module handle.
+                let mouse: HHOOK =
                     match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), None, 0) } {
                         Ok(h) => h,
                         Err(e) => {
@@ -138,22 +240,42 @@ mod imp {
                             return;
                         }
                     };
+                let kb: Option<HHOOK> = if keyboard {
+                    match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) }
+                    {
+                        Ok(h) => Some(h),
+                        Err(e) => {
+                            unsafe {
+                                let _ = UnhookWindowsHookEx(mouse);
+                            }
+                            let _ = ready_tx.send(Err(e.to_string()));
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 if ready_tx.send(Ok(())).is_err() {
-                    // SAFETY: `hook` came from a successful SetWindowsHookExW.
                     unsafe {
-                        let _ = UnhookWindowsHookEx(hook);
-                    };
+                        let _ = UnhookWindowsHookEx(mouse);
+                        if let Some(k) = kb {
+                            let _ = UnhookWindowsHookEx(k);
+                        }
+                    }
                     return;
                 }
 
-                // A low-level hook only fires while its thread pumps messages.
+                // Low-level hooks only fire while their thread pumps messages.
                 let mut msg = MSG::default();
                 while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
 
-                // SAFETY: `hook` is still the handle we installed.
                 unsafe {
-                    let _ = UnhookWindowsHookEx(hook);
-                };
+                    let _ = UnhookWindowsHookEx(mouse);
+                    if let Some(k) = kb {
+                        let _ = UnhookWindowsHookEx(k);
+                    }
+                }
             })
             .map_err(|e| HookError::Install(e.to_string()))?;
 
@@ -172,12 +294,33 @@ mod tests {
 
     #[test]
     fn the_swallow_flag_is_caller_owned_and_starts_clear() {
-        // The grab authority must live with the KVM state machine, not inside the hook,
-        // so the two can never disagree about whether input is being taken.
+        // Grab authority lives with the KVM state machine, not inside the hook, so the
+        // two can never disagree about whether input is being taken.
         let flag = Arc::new(AtomicBool::new(false));
         assert!(!flag.load(Ordering::Relaxed));
         flag.store(true, Ordering::Relaxed);
         assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_emergency_vk_matches_the_registered_hotkey_label() {
+        // If these drift apart, the documented escape hatch presses one key while the
+        // hook watches for another, and a grabbed keyboard has no way out.
+        assert_eq!(EMERGENCY_VK, 0x55);
+        assert!(crate::hotkey::EMERGENCY_RELEASE_LABEL.ends_with('U'));
+    }
+
+    #[test]
+    fn emergency_release_is_a_distinct_event_from_an_ordinary_key() {
+        // The driver must be able to act on it without decoding scancodes, since the
+        // release has to work even if the keymap is wrong.
+        let release = HookEvent::EmergencyRelease;
+        let key = HookEvent::Key {
+            scancode: 0x16,
+            extended: false,
+            down: true,
+        };
+        assert_ne!(release, key);
     }
 
     #[cfg(not(windows))]
@@ -185,7 +328,7 @@ mod tests {
     fn non_windows_reports_unsupported_rather_than_silently_observing_nothing() {
         let flag = Arc::new(AtomicBool::new(false));
         assert!(matches!(
-            spawn_mouse_hook(flag),
+            spawn_input_hooks(flag, true),
             Err(HookError::Unsupported)
         ));
     }

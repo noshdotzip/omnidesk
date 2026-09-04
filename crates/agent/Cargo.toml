@@ -21,7 +21,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
+
+# Audio playback uses WASAPI through cpal; only the receiving side needs it.
+[target.'cfg(windows)'.dependencies]
+cpal = "0.15"
 
 # The Wayland/portal backend only exists on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]

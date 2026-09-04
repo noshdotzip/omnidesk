@@ -130,6 +130,142 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 ///
 /// Handoff — where local input is grabbed and the local cursor is hidden — needs
 /// low-level hooks and an emergency-release hotkey, neither of which exists yet.
+/// A write-mostly connection to a peer agent, for streaming input at it.
+///
+/// # Why this does not wait for each acknowledgement
+/// [`kvm_mirror`] writes one message and then blocks reading its `Injected` response
+/// before sending the next. That costs a full network round trip per event. It is fine
+/// for a demo that samples the cursor 125 times a second, and completely wrong for a
+/// KVM: captured input arrives in bursts, and serialising each event behind an RTT adds
+/// latency exactly where it is most visible — a dragged window or a fast mouse flick
+/// lands behind the operator's hand.
+///
+/// So writes are pipelined and the responses are drained by a background task. TCP's
+/// own backpressure bounds how far ahead the sender can run.
+///
+/// Errors are still noticed. The drain task counts refusals and records the first one,
+/// and [`PeerSink::send`] fails once the connection is gone, so a peer that stops
+/// accepting input surfaces rather than being written into a void.
+pub struct PeerSink {
+    write: tokio::io::WriteHalf<TcpStream>,
+    state: std::sync::Arc<PeerSinkState>,
+    drain: tokio::task::JoinHandle<()>,
+    sent: u64,
+}
+
+#[derive(Default)]
+struct PeerSinkState {
+    /// Set when the peer closes the connection or answers with an error.
+    dead: std::sync::atomic::AtomicBool,
+    refusals: std::sync::atomic::AtomicU64,
+    first_error: std::sync::Mutex<Option<String>>,
+}
+
+impl PeerSink {
+    /// Connect and complete the handshake.
+    ///
+    /// The handshake *is* synchronous: nothing may be pipelined until the peer has
+    /// accepted the token, or a rejected connection would silently swallow a burst of
+    /// injected input.
+    pub async fn connect(addr: &str, token: &str) -> anyhow::Result<Self> {
+        let stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("could not connect to peer at {addr}"))?;
+        // Nagle would coalesce input events into 40ms batches, which is the opposite of
+        // what this connection is for.
+        stream.set_nodelay(true).ok();
+        let (read_half, mut write) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
+
+        let mut out = serde_json::to_string(&IpcRequest::Hello {
+            token: token.to_string(),
+            protocol_version: ultidesk_core::protocol::PROTOCOL_VERSION,
+        })?;
+        out.push('\n');
+        write.write_all(out.as_bytes()).await?;
+        write.flush().await?;
+
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        if !line.contains("HelloOk") {
+            anyhow::bail!("peer rejected the handshake: {}", line.trim());
+        }
+
+        let state = std::sync::Arc::new(PeerSinkState::default());
+        let drain_state = state.clone();
+        let drain = tokio::spawn(async move {
+            use std::sync::atomic::Ordering;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => {
+                        drain_state.dead.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    Ok(_) => {
+                        if line.contains("\"Error\"") {
+                            drain_state.refusals.fetch_add(1, Ordering::Relaxed);
+                            let mut first = drain_state.first_error.lock().unwrap();
+                            if first.is_none() {
+                                *first = Some(line.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(PeerSink {
+            write,
+            state,
+            drain,
+            sent: 0,
+        })
+    }
+
+    /// Queue one message. Does not wait for the peer to act on it.
+    pub async fn send(&mut self, req: &IpcRequest) -> anyhow::Result<()> {
+        if self.state.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("peer closed the connection");
+        }
+        let mut msg = serde_json::to_string(req)?;
+        msg.push('\n');
+        self.write.write_all(msg.as_bytes()).await?;
+        // Flushed per message rather than batched: a buffered input event that arrives
+        // late is worse than an extra syscall.
+        self.write.flush().await?;
+        self.sent += 1;
+        Ok(())
+    }
+
+    /// Ask the peer to drop everything it is holding, then close.
+    ///
+    /// Sent before hanging up because a key that was down when control returned would
+    /// otherwise stay down on the peer — a stuck modifier makes the other machine
+    /// unusable, and the operator is no longer looking at it.
+    pub async fn close(mut self) -> anyhow::Result<PeerSinkReport> {
+        use std::sync::atomic::Ordering;
+        let _ = self.send(&IpcRequest::ReleaseAllInput).await;
+        let _ = self.write.shutdown().await;
+        self.drain.abort();
+        let first = self.state.first_error.lock().unwrap().clone();
+        Ok(PeerSinkReport {
+            sent: self.sent,
+            refusals: self.state.refusals.load(Ordering::Relaxed),
+            first_error: first,
+        })
+    }
+}
+
+/// What happened over the life of a [`PeerSink`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSinkReport {
+    pub sent: u64,
+    pub refusals: u64,
+    pub first_error: Option<String>,
+}
+
 pub async fn kvm_mirror(
     addr: &str,
     token: &str,
@@ -149,25 +285,11 @@ pub async fn kvm_mirror(
     );
     println!("remote screen: {remote_w}x{remote_h}");
 
-    let stream = TcpStream::connect(addr)
-        .await
-        .with_context(|| format!("could not connect to peer at {addr}"))?;
-    stream.set_nodelay(true).ok();
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
-
-    let mut out = serde_json::to_string(&IpcRequest::Hello {
-        token: token.to_string(),
-        protocol_version: ultidesk_core::protocol::PROTOCOL_VERSION,
-    })?;
-    out.push('\n');
-    write_half.write_all(out.as_bytes()).await?;
-    write_half.flush().await?;
-    reader.read_line(&mut line).await?;
-    if !line.contains("HelloOk") {
-        anyhow::bail!("peer rejected the handshake: {}", line.trim());
-    }
+    // Pipelined through PeerSink rather than waiting for each `Injected`. Blocking on
+    // the acknowledgement put a full network round trip between reading the cursor and
+    // reading it again, which both added latency to every update and capped the sample
+    // rate at 1/RTT no matter what the sleep below said.
+    let mut sink = PeerSink::connect(addr, token).await?;
     println!("handshake accepted; mirroring for {seconds}s — move your mouse");
 
     let remote_vs = VirtualScreenDto {
@@ -178,7 +300,6 @@ pub async fn kvm_mirror(
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     let mut last_sent: Option<(i32, i32)> = None;
-    let mut sent = 0u64;
 
     while std::time::Instant::now() < deadline {
         if let Some((lx, ly)) = cursor_position() {
@@ -186,29 +307,28 @@ pub async fn kvm_mirror(
             let ry = map_edge_crossing((ly - vs.top) as f64, vs.height as f64, remote_h) as i32;
             // Only send on change: a still pointer should cost nothing on the wire.
             if last_sent != Some((rx, ry)) {
-                let mut msg = serde_json::to_string(&IpcRequest::InjectMouseMove {
+                sink.send(&IpcRequest::InjectMouseMove {
                     screen_x: rx,
                     screen_y: ry,
                     virtual_screen: remote_vs,
-                })?;
-                msg.push('\n');
-                write_half.write_all(msg.as_bytes()).await?;
-                write_half.flush().await?;
-                line.clear();
-                if reader.read_line(&mut line).await? == 0 {
-                    anyhow::bail!("peer closed the connection");
-                }
-                if !line.contains("Injected") {
-                    anyhow::bail!("peer refused a move: {}", line.trim());
-                }
+                })
+                .await?;
                 last_sent = Some((rx, ry));
-                sent += 1;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(8)).await;
     }
 
-    println!("mirrored {sent} pointer updates");
+    let report = sink.close().await?;
+    println!(
+        "mirrored {} pointer updates, {} refused{}",
+        report.sent,
+        report.refusals,
+        report
+            .first_error
+            .map(|e| format!(" (first: {e})"))
+            .unwrap_or_default()
+    );
     Ok(())
 }
 

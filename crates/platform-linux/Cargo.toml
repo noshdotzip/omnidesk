@@ -12,7 +12,9 @@ publish = false
 # later satisfy the same shapes". Depending on it from here honours that intent but
 # reads backwards; the types should move to a neutral crate when a third backend lands.
 ultidesk-platform-windows = { workspace = true }
+ultidesk-core = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -20,3 +22,21 @@ tracing = { workspace = true }
 # still builds on Windows/macOS (where every entry point returns `Unsupported`).
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# Native PipeWire client. 0.10 is the first release that builds against PipeWire 1.6:
+# libspa 0.8 fails there because bindgen emits spa_pod_builder as an opaque type.
+# v0_3_33 is the minimum feature that exposes SPA_POD_PROP_FLAG_DONT_FIXATE, which the
+# DMA-BUF modifier negotiation needs. Deliberately not v1_6_0: the higher feature would
+# raise the required PipeWire version for everyone to match this one dev box.
+pipewire = { version = "0.10", features = ["v0_3_33"] }
+# Raw SPA constants. libspa exposes typed helpers for format params but not for
+# SPA_PARAM_BUFFERS_dataType, and hardcoding an ABI constant is how a silent
+# mis-negotiation gets introduced.
+libspa-sys = "0.10"
+# Pure-Rust libei. The C library would need libclang for bindgen and would bring its
+# own event loop into the process; this needs neither. The InputCapture portal only
+# arbitrates capture -- it carries no input events -- so without a libei client the
+# barriers fire and nothing arrives.
+reis = { version = "0.7", features = ["tokio"] }
+# reis' event stream is a `futures::Stream`, and the handshake is async.
+futures-util = "0.3"
+tokio = { version = "1", features = ["net", "rt"] }

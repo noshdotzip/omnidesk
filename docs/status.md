@@ -1,6 +1,6 @@
 # Ultidesk status
 
-Honest snapshot of what is built, verified, and not. Updated 2026-07-31.
+Honest snapshot of what is built, verified, and not. Updated 2026-09-04.
 
 ## Milestone position
 
@@ -68,6 +68,25 @@ KDE Plasma Wayland session.
   fires and there is no error to chase. **The D-Bus session for InputCapture is not
   written yet**, and even once it is, actual event delivery needs a libei client
   (`ConnectToEIS` + the `reis` crate). No input has been captured.
+- **Audio routing works BOTH WAYS** (verified 2026-09-03).
+  Arch -> Windows: `audio-send` on
+  Arch captures a PipeWire sink's *monitor* via `pw-record` and streams raw s16le
+  PCM; `audio-recv` on Windows plays it through WASAPI (cpal). Measured: 1.4 MB /
+  351,232 frames over an 8s run = 7.3s of audio at 48 kHz stereo, which is the
+  stream duration, so nothing was dropped or misaligned. Clean disconnect.
+  **Not confirmed audible**: the Arch box may have been playing silence, and nobody
+  was listening on the Windows end. The byte and frame accounting proves the path,
+  not the sound.
+  Windows -> Arch: `audio-send` captures the default render endpoint via **WASAPI
+  loopback** (`AUDCLNT_STREAMFLAGS_LOOPBACK`, direct COM — cpal does not expose it)
+  and `audio-recv` on Arch plays through `pw-play`. Measured 2.6 MB / 645,120 frames
+  = 13.4s at 48 kHz stereo, clean exit when the peer closed.
+  The Windows capture reports the endpoint's **actual** mix format rather than the
+  requested one, because shared mode does not negotiate; a 5.1 endpoint is rejected
+  with guidance instead of being mislabelled as stereo.
+  Uncompressed, so it needs ~1.5 Mbit/s — fine on the measured 167+ Mbit/s LAN.
+  Neither direction is confirmed *audible*: the accounting proves the path, not the
+  sound.
 - **KVM handoff implemented, NOT yet run on real hardware** (`kvm-handoff`). Grabs
   the local pointer with a `WH_MOUSE_LL` hook when it reaches the right edge and
   forwards motion to the peer. Built on `core::kvm` (10 tests pinning that every
@@ -171,22 +190,186 @@ on-screen capture indicators, named-pipe ACL hardening.
    read them yet — that needs the GUI. A software OpenH264 fallback on ARM64 would be a
    serious performance bug and is the first thing to check once the GUI runs.
 
+## Verified: zero-copy video capture (2026-09-03)
+
+`ultidesk-agent cast-test start` against KDE Plasma 6.7.2:
+
+```
+node 103: frames=1 size=800x628 max_fps=144 dma-buf=1 mapped=0
+  allocated DmaBuf — zero-copy capable
+```
+
+Getting there needed all three of these, and each was necessary but not sufficient
+on its own — each was measured, not assumed:
+
+1. **Do not set `StreamFlags::MAP_BUFFERS`.** It forces PipeWire to mmap every
+   buffer, which defeats DMA-BUF outright. Removing it alone changed nothing.
+2. **Advertise `SPA_PARAM_BUFFERS_dataType`** as a single combined bitmask including
+   `SPA_DATA_DmaBuf`. Encoding it as enumerated alternatives instead produces
+   `error alloc buffers: Invalid argument` and a stream that negotiates a format and
+   then never allocates a buffer. Still yielded shared memory once fixed.
+3. **Negotiate a DRM modifier.** `SPA_FORMAT_VIDEO_modifier`, MANDATORY and
+   DONT_FIXATE, offering `DRM_FORMAT_MOD_INVALID`. This is the step that actually
+   flips KWin to DMA-BUF.
+
+The modifier-bearing format is offered *alongside* the plain one, so a compositor or
+GPU that cannot do DMA-BUF still negotiates shared memory rather than failing. Slower
+is acceptable; not working is not.
+
+Buffer kind is read from the `add_buffer` callback, which fires at allocation before
+any frame. That matters because compositors send frames on damage rather than on a
+clock, so a static window produces none — and without this, "nothing moved" and
+"negotiation failed" look identical.
+
+## Verified: control UI — display arrangement and audio routing (2026-09-04)
+
+Built with Dioxus 0.6 desktop ([ADR-0010](adrs/0010-dioxus-control-ui.md)) and running
+**natively** on `aarch64-pc-windows-msvc`; the renderer is WebView2, confirmed by the
+`webview2-com` dependency rather than assumed.
+
+- `cargo test --workspace` -> **233 tests pass** on Windows ARM64 and on Arch x64.
+  Clippy `-D warnings` and `cargo fmt --check` clean on both.
+- **Display arrangement**: monitors drag and snap; overlaps are flagged; shared borders
+  are listed. All geometry comes from `ultidesk-topology::layout` so the editor cannot
+  disagree with the agent. Verified on screen that a 1109-tall and a 1080-tall monitor
+  report **1080px** of shared border — the overlapping-span rule, not the taller edge.
+- **Audio device enumeration**, native on both platforms
+  ([ADR-0011](adrs/0011-audio-routing-loop-prevention.md)): 6 endpoints on Arch via the
+  PipeWire registry (4 sinks, 2 sources, correct defaults) and 2 on Windows ARM64 via
+  WASAPI. Exposed as `ultidesk-agent audio-devices`.
+- The Linux walk needs **two** `sync` round-trips, measured rather than assumed: with
+  one, 0 of 6 devices come back marked default; with two, the correct 2 do.
+- **Feedback-loop refusal verified end-to-end in the UI**: selecting the same output as
+  both source and sink disables "Add route" and explains why, naming the device rather
+  than its GUID.
+
+**Verified on Linux 2026-09-04**, once `xdotool` was installed (`muda`, pulled in by
+`tao`, links `libxdo` unconditionally). The whole workspace — `ultidesk-control`
+included — passes `cargo clippy --all-targets -D warnings`, `cargo fmt --check` and
+233 tests on Arch.
+
+The app runs on KDE Plasma Wayland as a **native Wayland window**, not through
+XWayland (confirmed by `xdotool search` finding nothing). Both tabs render, and the
+audio panel enumerates all six PipeWire endpoints through
+`apps/control/src/devices.rs` — 4 sinks and 2 sources, with Speaker and Digital
+Microphone marked default, and the "play on" column correctly excluding the
+microphones.
+
+One caveat found while testing, worth knowing before packaging: `global-hotkey`
+(a non-optional dependency of `dioxus-desktop` on Linux, with no feature flag to
+disable it) spawns a thread that calls `XDefaultRootWindow` without checking whether
+`XOpenDisplay` succeeded. If X11 is unreachable the app **segfaults at startup**
+rather than degrading. A normal desktop launch is fine because the session provides
+`DISPLAY` and `XAUTHORITY`; it crashed only when launched over SSH with `DISPLAY` set
+but `XAUTHORITY` missing. A pure Wayland session with no XWayland would hit the same
+crash, so this is a real robustness limit of the dependency and not merely a testing
+artefact.
+
+The panel still cannot read a *peer's* devices — that needs the settings IPC — and
+says so rather than showing a placeholder.
+
+## Measured: the network link is the dominant latency cost (2026-09-04)
+
+The two machines talk over a Wi-Fi link (Arch on `wlan0`, 5 GHz, via the Windows
+machine's hosted network at `192.168.137.1`). Earlier work measured its *throughput*
+at 167+ Mbit/s and treated the link as solved. Throughput is the wrong metric for a
+KVM: what the operator feels is round-trip latency, and that turns out to be an order
+of magnitude worse than assumed.
+
+| Windows -> Arch ICMP | min | avg | max |
+| --- | --- | --- | --- |
+| Arch radio idle | 16 ms | ~150 ms | 519 ms |
+| Arch radio kept busy | 5 ms | 20 ms | 42 ms |
+
+The two rows differ only in whether the Arch machine was transmitting at the time.
+Arch -> Windows in the same conditions averages 15 ms, so the penalty is one-directional.
+
+That asymmetry is the signature of **Wi-Fi power save**: `iwconfig` reports
+`Power Management: on`, and a sleeping client cannot receive until it next wakes, so
+inbound packets queue at the access point. It is not signal quality -- the link is
+-42 dBm at 68/70 with a 1.13 Gb/s negotiated rate.
+
+Why it matters more than it looks:
+
+- The old `kvm_mirror`, which waited for each `Injected` acknowledgement before sending
+  the next update, was capped at **1/RTT ~= 7 pointer updates per second** on this link.
+  It was not a demo of a slightly laggy KVM; it was a demo of an unusable one. This is
+  what motivated `PeerSink`, and it makes the pipelining change worth roughly 20x on the
+  achievable update rate here rather than the marginal gain it would be on a wired LAN.
+- Uncompressed PCM audio (1.5 Mbit/s) has no jitter buffer, so 500 ms spikes are
+  audible dropouts. This is a second reason to replace it with Opus/RTP, independent of
+  bandwidth.
+- Any figure quoted for input or projection latency is meaningless until power save is
+  settled, because the link contributes more variance than everything else combined.
+
+**Fixed 2026-09-04** with `sudo iw dev wlan0 set power_save off`. Re-measured
+immediately afterwards, same direction and same link:
+
+| Windows -> Arch ICMP | min | avg | max |
+| --- | --- | --- | --- |
+| Before (power save on) | 16 ms | ~150 ms | 519 ms |
+| After (power save off) | 4 ms | 28 ms | 124 ms |
+
+Roughly 5x on the average and 4x on the worst case, and the half-second outliers are
+gone entirely (30 consecutive samples spanned 4-41 ms). 28 ms is still high for a
+-42 dBm 5 GHz link, so there is more to find here, but it is no longer the dominant
+term.
+
+This does **not** survive a reboot. To persist it, a NetworkManager drop-in at
+`/etc/NetworkManager/conf.d/wifi-powersave.conf` with `wifi.powersave = 2`. The Arch
+machine also has an idle wired interface (`eno1`, state DOWN); a cable removes the
+variable entirely and is worth preferring for any latency figure meant to be quoted.
+
+The Arch machine also has an idle wired interface (`eno1`, state DOWN). If a cable is
+available, that removes the variable entirely and is worth preferring for any latency
+measurement that is meant to be quoted.
+
+Note `iw` is not installed; the readings above came from `iwconfig` (net-tools) and
+`ping`.
+
+## Blocked
+
+- ~~PipeWire video capture needs `clang`~~ — **resolved**: clang was installed, and
+  `pipewire 0.10` (not 0.8, which fails against PipeWire 1.6.7 because bindgen emits
+  `spa_pod_builder` as an opaque type) builds cleanly. Kept here only as the record of
+  what the blocker was.
+- **Historic:** PipeWire video capture needed `clang` on the Arch box. The ScreenCast
+  portal is complete — `cast-test start` returns a real node id, a restore token and
+  an authorised PipeWire fd — but turning that fd into frames needs a PipeWire
+  client, and every route is closed on this machine:
+  - `pipewire-rs` fails to build: `libspa-sys` runs bindgen, which panics with
+    "Unable to find libclang". `clang` and `libclang.so` are absent (verified by
+    building the crate, not just by probing).
+  - GStreamer is installed but has neither `pipewiresrc` nor **any** H.264 encoder
+    (`x264enc`, `vah264enc`, `vaapih264enc`, `openh264enc` all absent), so the CLI
+    shim that worked for audio is not available for video.
+  - `libpipewire-0.3` (1.6.7) and `libspa-0.2` headers *are* present, and VAAPI
+    hardware exists (`/dev/dri/renderD128`), so only the toolchain is missing.
+
+  Unblock with `sudo pacman -S clang` (and `gst-plugins-good`/`gstreamer-vaapi` if
+  the CLI route is preferred later). Installing needs a password, so it cannot be
+  done unattended.
+
+  Note `reis` (the pure-Rust libei client, needed for InputCapture event delivery)
+  builds fine without clang — only the video path is blocked.
+
 ## Planned / requested work
 
-- **Dioxus control UI** — topology editor (dragging monitor rectangles into their
-  virtual arrangement), cursor settings, audio routing and speaker selection,
-  per-peer permissions, pairing. Requested 2026-09-03; see
-  [ADR-0010](adrs/0010-dioxus-control-ui.md), recorded as Proposed rather than
-  Accepted because it adds a second UI stack alongside Electron and the renderer
-  choice is unresolved. Visual reference: the Kopuz music player's Dioxus UI (not
-  yet reviewed — confirm the repository before treating it as a spec).
+- **Dioxus control UI** — *partly built*, see the verified section above. The
+  display-arrangement editor and the audio-routing panel exist and run natively on
+  Windows ARM64. Still to do: cursor settings, per-peer permissions, pairing, and
+  loading/persisting real state instead of an in-memory layout — all of which need
+  the settings IPC surface. Visual reference: the Kopuz music player's Dioxus UI
+  (not yet reviewed — confirm the repository before treating it as a spec).
 - **libei client** (`reis`) so InputCapture actually delivers events; the portal
   arbitrates capture, it does not carry input.
 - **PipeWire client** so ScreenCast's `OpenPipeWireRemote` fd becomes video frames.
 - **Peer transport** (Milestone 1) — without it nothing crosses machines regardless
   of how well either backend works.
-- **Audio routing** — PipeWire `rtp-sink`/`rtp-source` already present on the Arch
-  box; the one goal needing no portal permission.
+- **Audio transport quality** — the routing model and device selection are built
+  (see above), but the stream itself is still uncompressed PCM over plaintext TCP and
+  Linux playback still shells out to `pw-play`. Opus/RTP over the ADR-0002 transport
+  is the target; PipeWire `rtp-sink`/`rtp-source` are present on the Arch box.
 
 ## Exact next step
 

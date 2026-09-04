@@ -15,10 +15,12 @@
 mod types;
 pub use types::{RectPx, WindowInfo};
 
+pub mod audio_devices;
 pub mod cursor;
 pub mod hook;
 pub mod hotkey;
 pub mod inject;
+pub mod loopback;
 
 #[cfg(windows)]
 mod windows_impl;

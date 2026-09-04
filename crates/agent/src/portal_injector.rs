@@ -79,6 +79,12 @@ impl Drop for PortalInjector {
     }
 }
 
+impl PortalInjector {
+    /// Portal axis numbering: 0 vertical, 1 horizontal.
+    const AXIS_VERTICAL: u32 = 0;
+    const AXIS_HORIZONTAL: u32 = 1;
+}
+
 impl Injector for PortalInjector {
     fn mouse_move(
         &self,
@@ -118,6 +124,28 @@ impl Injector for PortalInjector {
         self.session
             .pointer_button(portal_button, down)
             .map_err(map_err)
+    }
+
+    /// Scroll, converting from the wire's Win32 units back to portal steps.
+    ///
+    /// The wire carries multiples of `WHEEL_DELTA` in Win32's sign convention
+    /// (positive is away from the user); the portal wants whole steps in Wayland's
+    /// (positive is toward the user). So the vertical axis is divided *and* negated.
+    /// Horizontal agrees on sign and is only divided.
+    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), InputError> {
+        let steps_y = -delta_y / ultidesk_core::scroll::WHEEL_DELTA;
+        let steps_x = delta_x / ultidesk_core::scroll::WHEEL_DELTA;
+        if steps_y != 0 {
+            self.session
+                .pointer_axis_discrete(Self::AXIS_VERTICAL, steps_y)
+                .map_err(map_err)?;
+        }
+        if steps_x != 0 {
+            self.session
+                .pointer_axis_discrete(Self::AXIS_HORIZONTAL, steps_x)
+                .map_err(map_err)?;
+        }
+        Ok(())
     }
 
     fn key(&self, scancode: u16, down: bool) -> Result<(), InputError> {

@@ -129,6 +129,9 @@ mod tests {
         fn key(&self, _: u16, _: bool) -> Result<(), InputError> {
             Ok(())
         }
+        fn scroll(&self, _: i32, _: i32) -> Result<(), InputError> {
+            Ok(())
+        }
         fn enumerate(&self) -> Vec<WindowDto> {
             vec![]
         }

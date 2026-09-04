@@ -1,0 +1,28 @@
+[package]
+name = "ultidesk-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ultidesk-control"
+path = "src/main.rs"
+
+[dependencies]
+# Desktop renderer. On Windows this is WebView2, which builds natively for aarch64 —
+# verified before committing to it (ADR-0010, and ADR-0008 forbids an emulated build).
+dioxus = { version = "0.6", features = ["desktop"] }
+ultidesk-core = { workspace = true }
+ultidesk-topology = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Audio device enumeration is per-platform, so the control app links the same backends
+# the agent does rather than re-implementing enumeration against a second code path.
+[target.'cfg(windows)'.dependencies]
+ultidesk-platform-windows = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ultidesk-platform-linux = { workspace = true }

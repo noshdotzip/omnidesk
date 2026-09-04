@@ -41,6 +41,14 @@ pub enum IpcRequest {
         scancode: u16,
         down: bool,
     },
+    /// Wheel movement in Win32 units (multiples of `WHEEL_DELTA`), already whole
+    /// notches and already in the receiver's sign convention. The sender owns the
+    /// accumulation and the sign flip (`ultidesk_core::scroll`) so every receiver does
+    /// not have to re-derive them.
+    InjectScroll {
+        delta_x: i32,
+        delta_y: i32,
+    },
     /// Release every key/button this session is currently holding. Idempotent.
     ReleaseAllInput,
 }
@@ -121,6 +129,7 @@ pub trait Injector {
         -> Result<(), InputError>;
     fn mouse_button(&self, button: MouseButton, down: bool) -> Result<(), InputError>;
     fn key(&self, scancode: u16, down: bool) -> Result<(), InputError>;
+    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), InputError>;
     fn enumerate(&self) -> Vec<WindowDto>;
 }
 
@@ -137,6 +146,9 @@ impl Injector for RealInjector {
     }
     fn key(&self, scancode: u16, down: bool) -> Result<(), InputError> {
         ultidesk_platform_windows::inject::key_scancode(scancode, down)
+    }
+    fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), InputError> {
+        ultidesk_platform_windows::inject::mouse_scroll(delta_x, delta_y)
     }
     fn enumerate(&self) -> Vec<WindowDto> {
         ultidesk_platform_windows::enumerate_top_level_windows()
@@ -256,6 +268,15 @@ impl Session {
                 }
                 Err(e) => input_err(e),
             },
+            // Scroll holds no state, so unlike keys and buttons there is nothing to
+            // track here and nothing for ReleaseAllInput to undo: a wheel notch is
+            // instantaneous and cannot be left stuck down.
+            IpcRequest::InjectScroll { delta_x, delta_y } => {
+                match injector.scroll(delta_x, delta_y) {
+                    Ok(()) => IpcResponse::Injected,
+                    Err(e) => input_err(e),
+                }
+            }
             IpcRequest::ReleaseAllInput => {
                 let count = self.release_all(injector);
                 IpcResponse::Released { count }
@@ -337,6 +358,10 @@ mod tests {
             self.events
                 .borrow_mut()
                 .push(format!("key {scancode} {down}"));
+            Ok(())
+        }
+        fn scroll(&self, dx: i32, dy: i32) -> Result<(), InputError> {
+            self.events.borrow_mut().push(format!("scroll {dx},{dy}"));
             Ok(())
         }
         fn enumerate(&self) -> Vec<WindowDto> {
