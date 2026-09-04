@@ -11,10 +11,13 @@
 pub mod error;
 pub mod ids;
 pub mod input_guard;
+pub mod keymap;
 pub mod kvm;
 pub mod projection;
 pub mod protocol;
+pub mod scroll;
 
 pub use error::{CoreError, Result};
 pub use ids::{DeviceId, EventId, LeaseId, ProjectionId, SessionId};
 pub use projection::{ProjectionEvent, ProjectionState, ProjectionStateMachine, TransitionError};
+pub use scroll::{ScrollAccumulator, WheelDelta, PIXELS_PER_NOTCH, WHEEL_DELTA};

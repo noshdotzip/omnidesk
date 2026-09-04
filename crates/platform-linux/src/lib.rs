@@ -30,7 +30,9 @@ pub mod audio_devices;
 pub mod caps;
 pub mod ei_client;
 pub mod input_capture;
-pub mod keymap;
+// Moved to `ultidesk-core` once the agent needed it too (it is pure arithmetic, not
+// platform code). Re-exported so the portal injector's path does not change.
+pub use ultidesk_core::keymap;
 pub mod pipewire_capture;
 pub mod pointer;
 pub mod portal;

@@ -12,6 +12,7 @@ publish = false
 # later satisfy the same shapes". Depending on it from here honours that intent but
 # reads backwards; the types should move to a neutral crate when a third backend lands.
 ultidesk-platform-windows = { workspace = true }
+ultidesk-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

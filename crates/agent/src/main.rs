@@ -11,8 +11,9 @@
 //!   ultidesk-agent probe       Print what the local desktop can actually do, as JSON.
 //!                              Linux only; read-only, raises no permission dialog.
 //!   ultidesk-agent kvm-source  Capture this desktop's input at a screen edge and
-//!                              print the events. Linux only. GRABS INPUT — press Esc
-//!                              to release.
+//!                              drive a peer with it. Linux only. GRABS INPUT — press
+//!                              Esc to release.
+//!                              kvm-source [peer:port token [w h]]
 //!   ultidesk-agent audio-devices Print this machine's audio endpoints as JSON.
 //!                              Read-only; raises no permission dialog on either
 //!                              platform.
@@ -22,6 +23,7 @@
 
 mod audio;
 mod endpoint;
+mod forward;
 #[cfg(windows)]
 mod handoff;
 mod ipc;
@@ -484,12 +486,15 @@ fn kvm_handoff() -> Result<()> {
     )
 }
 
-/// Capture this desktop's input at a screen edge and print what arrives.
+/// Capture this desktop's input at a screen edge and drive a peer with it.
 ///
 /// This is the Linux half of the KVM: the machine becomes a *source*, so its pointer
-/// and keyboard can drive a peer. `capture-test` stops after placing barriers because
-/// that much is silent; this one goes all the way — Enable, then ConnectToEIS, then a
-/// libei client on the returned socket.
+/// and keyboard drive a Windows peer. `capture-test` stops after placing barriers
+/// because that much is silent; this one goes all the way — Enable, then ConnectToEIS,
+/// then a libei client on the returned socket, then translation onto the wire.
+///
+/// With no peer address it prints the events instead of sending them, which is how to
+/// check that capture works before involving a second machine.
 ///
 /// # This grabs real input
 /// Once capture engages, the compositor routes the pointer and keyboard here instead of
@@ -498,12 +503,25 @@ fn kvm_handoff() -> Result<()> {
 /// also releases capture, because the compositor drops the session with the connection.
 #[cfg(target_os = "linux")]
 fn kvm_source() -> Result<()> {
+    use crate::forward::{Forwarded, Forwarder};
     use ultidesk_platform_linux::caps::DeviceTypes;
     use ultidesk_platform_linux::ei_client::{capture_events, CapturedInput, EiSession};
     use ultidesk_platform_linux::input_capture::{Edge, InputCaptureSession};
+    use ultidesk_topology::{Rect, Side};
 
     /// evdev keycode for Esc. Not a keysym: libei reports evdev codes.
     const KEY_ESC: u32 = 1;
+
+    let peer = std::env::args().nth(2);
+    let token = std::env::args().nth(3);
+    let remote_w: f64 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1920.0);
+    let remote_h: f64 = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1080.0);
 
     eprintln!("Opening an InputCapture session (KDE may prompt for permission).");
     let session = InputCaptureSession::open(DeviceTypes {
@@ -534,6 +552,10 @@ fn kvm_source() -> Result<()> {
     let ei = EiSession::from_fd(fd)?;
 
     println!();
+    match &peer {
+        Some(addr) => println!("Forwarding to peer {addr} ({remote_w}x{remote_h})."),
+        None => println!("No peer given — printing events only."),
+    }
     println!("Capture is ARMED. Push the pointer off the RIGHT edge to engage it.");
     println!("Press Esc at any time to release input and exit.");
     println!();
@@ -541,34 +563,129 @@ fn kvm_source() -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let mut count: u64 = 0;
-    rt.block_on(capture_events(ei, |event| {
-        // Escape first, before any other handling: this is the operator's way out.
-        if let CapturedInput::Key {
-            keycode: KEY_ESC,
-            pressed: false,
-        } = event
-        {
-            println!("Esc — releasing input");
-            return false;
-        }
-        count += 1;
-        // Motion floods; printing every event makes the interesting ones unreadable.
-        match event {
-            CapturedInput::PointerMotion { .. } | CapturedInput::PointerMotionAbsolute { .. } => {
-                if count % 50 == 0 {
-                    println!("[{count}] {event:?}");
-                }
-            }
-            _ => println!("[{count}] {event:?}"),
-        }
-        true
-    }))?;
 
-    println!("captured {count} event(s)");
+    rt.block_on(async move {
+        // Crossing off this machine's right edge arrives on the peer's left. Entering
+        // at mid-height is a placeholder: the real fraction comes from where the
+        // pointer actually hit the barrier, which needs the Zone geometry the portal
+        // reports at crossing time.
+        let mut sink = match (&peer, &token) {
+            (Some(addr), Some(tok)) => Some(tcp::PeerSink::connect(addr, tok).await?),
+            (Some(_), None) => anyhow::bail!("a peer address also needs its auth token"),
+            (None, _) => None,
+        };
+        let mut fwd = Forwarder::new(
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: remote_w,
+                height: remote_h,
+            },
+            crate::ipc::VirtualScreenDto {
+                left: 0,
+                top: 0,
+                width: remote_w as i32,
+                height: remote_h as i32,
+            },
+            Side::Left,
+            0.5,
+        );
+        if let Some(sink) = sink.as_mut() {
+            sink.send(&fwd.initial_move()).await?;
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CapturedInput>();
+        // The libei callback is synchronous and the peer write is async, so events are
+        // handed across rather than blocking the capture loop on the network. An
+        // unbounded channel is right here: dropping input to apply backpressure would
+        // lose keystrokes, and TCP already bounds how far the writer can run ahead.
+        //
+        // `spawn_local`, not `spawn`: reis holds its protocol objects in `Rc`, so the
+        // capture future is `!Send` and cannot move to another worker thread. That is
+        // why the runtime above is single-threaded.
+        let local = tokio::task::LocalSet::new();
+        let pump = local.spawn_local(async move {
+            capture_events(ei, move |event| {
+                if let CapturedInput::Key {
+                    keycode: KEY_ESC,
+                    pressed: false,
+                } = event
+                {
+                    return false;
+                }
+                tx.send(event).is_ok()
+            })
+            .await
+        });
+
+        let mut count: u64 = 0;
+        local
+            .run_until(async {
+                while let Some(event) = rx.recv().await {
+                    count += 1;
+                    let wire = to_wire(event);
+                    match fwd.translate(wire) {
+                        Forwarded::Send(req) => match sink.as_mut() {
+                            Some(sink) => sink.send(&req).await?,
+                            None => {
+                                if count % 50 == 0 {
+                                    println!("[{count}] {req:?}");
+                                }
+                            }
+                        },
+                        Forwarded::Pending => {}
+                        Forwarded::Dropped(reason) => {
+                            tracing::debug!(?reason, "event could not be forwarded");
+                        }
+                        Forwarded::ReturnHome => {
+                            println!("pointer returned home");
+                            break;
+                        }
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await?;
+
+        println!("captured {count} event(s), {} dropped", fwd.dropped());
+        if let Some(sink) = sink {
+            let report = sink.close().await?;
+            println!(
+                "sent {} message(s), {} refused{}",
+                report.sent,
+                report.refusals,
+                report
+                    .first_error
+                    .map(|e| format!(" (first: {e})"))
+                    .unwrap_or_default()
+            );
+        }
+        pump.abort();
+        Ok::<(), anyhow::Error>(())
+    })?;
+
     session.disable()?;
     session.close()?;
     Ok(())
+}
+
+/// Bridge the platform crate's event type to the agent's wire type.
+///
+/// Two declarations of the same shape exist on purpose: `forward` must compile on
+/// Windows, where the Linux crate is not a dependency. This is the one place they meet,
+/// so a field added to one and not the other fails to compile here rather than silently
+/// dropping input.
+#[cfg(target_os = "linux")]
+fn to_wire(e: ultidesk_platform_linux::ei_client::CapturedInput) -> crate::forward::CapturedInput {
+    use crate::forward::CapturedInput as W;
+    use ultidesk_platform_linux::ei_client::CapturedInput as L;
+    match e {
+        L::PointerMotion { dx, dy } => W::PointerMotion { dx, dy },
+        L::PointerMotionAbsolute { x, y } => W::PointerMotionAbsolute { x, y },
+        L::Button { button, pressed } => W::Button { button, pressed },
+        L::Scroll { dx, dy } => W::Scroll { dx, dy },
+        L::Key { keycode, pressed } => W::Key { keycode, pressed },
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
