@@ -243,11 +243,30 @@ Built with Dioxus 0.6 desktop ([ADR-0010](adrs/0010-dioxus-control-ui.md)) and r
   both source and sink disables "Add route" and explains why, naming the device rather
   than its GUID.
 
-Not verified: the control app does **not** build on Linux yet — `muda` (pulled in by
-`tao`) links `libxdo` unconditionally, and `xdotool` is not installed on the Arch box
-(69 KiB download; needs a sudo password). Nothing else in the workspace is affected.
-The panel also cannot read a *peer's* devices — that needs the settings IPC — and says
-so rather than showing a placeholder.
+**Verified on Linux 2026-09-04**, once `xdotool` was installed (`muda`, pulled in by
+`tao`, links `libxdo` unconditionally). The whole workspace — `ultidesk-control`
+included — passes `cargo clippy --all-targets -D warnings`, `cargo fmt --check` and
+233 tests on Arch.
+
+The app runs on KDE Plasma Wayland as a **native Wayland window**, not through
+XWayland (confirmed by `xdotool search` finding nothing). Both tabs render, and the
+audio panel enumerates all six PipeWire endpoints through
+`apps/control/src/devices.rs` — 4 sinks and 2 sources, with Speaker and Digital
+Microphone marked default, and the "play on" column correctly excluding the
+microphones.
+
+One caveat found while testing, worth knowing before packaging: `global-hotkey`
+(a non-optional dependency of `dioxus-desktop` on Linux, with no feature flag to
+disable it) spawns a thread that calls `XDefaultRootWindow` without checking whether
+`XOpenDisplay` succeeded. If X11 is unreachable the app **segfaults at startup**
+rather than degrading. A normal desktop launch is fine because the session provides
+`DISPLAY` and `XAUTHORITY`; it crashed only when launched over SSH with `DISPLAY` set
+but `XAUTHORITY` missing. A pure Wayland session with no XWayland would hit the same
+crash, so this is a real robustness limit of the dependency and not merely a testing
+artefact.
+
+The panel still cannot read a *peer's* devices — that needs the settings IPC — and
+says so rather than showing a placeholder.
 
 ## Measured: the network link is the dominant latency cost (2026-09-04)
 
@@ -283,14 +302,23 @@ Why it matters more than it looks:
 - Any figure quoted for input or projection latency is meaningless until power save is
   settled, because the link contributes more variance than everything else combined.
 
-**Fix (needs a password, so not applied):**
+**Fixed 2026-09-04** with `sudo iw dev wlan0 set power_save off`. Re-measured
+immediately afterwards, same direction and same link:
 
-```
-sudo iw dev wlan0 set power_save off
-```
+| Windows -> Arch ICMP | min | avg | max |
+| --- | --- | --- | --- |
+| Before (power save on) | 16 ms | ~150 ms | 519 ms |
+| After (power save off) | 4 ms | 28 ms | 124 ms |
 
-To make it survive a reboot, a NetworkManager drop-in
-(`/etc/NetworkManager/conf.d/wifi-powersave.conf` with `wifi.powersave = 2`).
+Roughly 5x on the average and 4x on the worst case, and the half-second outliers are
+gone entirely (30 consecutive samples spanned 4-41 ms). 28 ms is still high for a
+-42 dBm 5 GHz link, so there is more to find here, but it is no longer the dominant
+term.
+
+This does **not** survive a reboot. To persist it, a NetworkManager drop-in at
+`/etc/NetworkManager/conf.d/wifi-powersave.conf` with `wifi.powersave = 2`. The Arch
+machine also has an idle wired interface (`eno1`, state DOWN); a cable removes the
+variable entirely and is worth preferring for any latency figure meant to be quoted.
 
 The Arch machine also has an idle wired interface (`eno1`, state DOWN). If a cable is
 available, that removes the variable entirely and is worth preferring for any latency

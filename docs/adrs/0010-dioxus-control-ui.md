@@ -87,3 +87,13 @@ treated as settled on Linux.
   and costs nothing at runtime, but it is a real dependency the Electron path did not
   have, and worth naming rather than discovering at packaging time. Found 2026-09-04
   when the app first built against Arch — Windows had never surfaced it.
+- **And an X11 dependency that can crash the app, not just fail to link.**
+  `global-hotkey` is a non-optional dependency of `dioxus-desktop` on Linux — there is
+  no feature flag to drop it, and `dioxus-desktop` constructs a `GlobalHotKeyManager`
+  unconditionally. Its thread calls `XDefaultRootWindow` without checking that
+  `XOpenDisplay` succeeded, so if X11 is unreachable the app segfaults at startup
+  instead of losing hotkey support. A normal desktop launch is unaffected (the session
+  provides `DISPLAY` and `XAUTHORITY`), but a pure Wayland session with no XWayland
+  would hit it. The window itself is native Wayland; only the hotkey path needs X11.
+  Worth revisiting if the control UI ever needs to run headless or in a minimal
+  session.
