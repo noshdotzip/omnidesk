@@ -18,3 +18,11 @@ ultidesk-core = { workspace = true }
 ultidesk-topology = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# Audio device enumeration is per-platform, so the control app links the same backends
+# the agent does rather than re-implementing enumeration against a second code path.
+[target.'cfg(windows)'.dependencies]
+ultidesk-platform-windows = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ultidesk-platform-linux = { workspace = true }

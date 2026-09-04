@@ -217,18 +217,23 @@ pub async fn send(addr: &str, target: &str, format: AudioFormat) -> anyhow::Resu
 
 /// Capture what this machine is playing (WASAPI loopback) and stream it to a peer.
 ///
+/// `target` is a WASAPI endpoint id from `audio_devices::enumerate`; an empty string
+/// means the default render endpoint, and follows it.
+///
 /// `requested` is **ignored**: in shared mode the endpoint's mix format is not
 /// negotiable, so the capture reports what the device actually gave us and that is what
 /// goes in the header. Claiming the requested format instead would mislabel the stream
 /// and the receiver would play it at the wrong speed.
 #[cfg(windows)]
-pub async fn send(addr: &str, _target: &str, requested: AudioFormat) -> anyhow::Result<()> {
+pub async fn send(addr: &str, target: &str, requested: AudioFormat) -> anyhow::Result<()> {
     use anyhow::Context;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
-    use ultidesk_platform_windows::loopback::spawn_loopback_capture;
+    use ultidesk_platform_windows::loopback::spawn_loopback_capture_on;
 
-    let capture = spawn_loopback_capture().context("starting WASAPI loopback capture")?;
+    let endpoint = Some(target).filter(|t| !t.is_empty());
+    let capture =
+        spawn_loopback_capture_on(endpoint).context("starting WASAPI loopback capture")?;
     let format = AudioFormat {
         rate: capture.rate,
         channels: capture.channels,

@@ -10,6 +10,9 @@
 //!                              (No IPC, no elevation — a quick feasibility probe.)
 //!   ultidesk-agent probe       Print what the local desktop can actually do, as JSON.
 //!                              Linux only; read-only, raises no permission dialog.
+//!   ultidesk-agent audio-devices Print this machine's audio endpoints as JSON.
+//!                              Read-only; raises no permission dialog on either
+//!                              platform.
 //!   ultidesk-agent inject-test Open a RemoteDesktop portal session and nudge the
 //!                              pointer, to prove input injection works. Linux only.
 //!                              DOES prompt for permission and DOES move the cursor.
@@ -43,13 +46,14 @@ fn main() -> Result<()> {
         "kvm-demo" => kvm_demo(),
         "kvm-mirror" => kvm_mirror(),
         "kvm-handoff" => kvm_handoff(),
+        "audio-devices" => audio_devices(),
         "audio-send" => audio_send(),
         "audio-recv" => audio_recv(),
         "serve" => serve(),
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -474,6 +478,39 @@ fn kvm_handoff() -> Result<()> {
     anyhow::bail!(
         "kvm-handoff needs Windows low-level input hooks; the Linux source side needs libei"
     )
+}
+
+/// Print the machine's audio endpoints as JSON.
+///
+/// The routing UI needs a device list from each machine, and this is the shape it reads.
+/// The two platforms produce the same fields from completely different sources — the
+/// PipeWire registry and the WASAPI endpoint enumeration — so this is also where a
+/// divergence between them would show up first.
+fn audio_devices() -> Result<()> {
+    println!("{}", local_audio_devices_json()?);
+    Ok(())
+}
+
+// One function per platform rather than `cfg` blocks inside one body: the blocks each
+// need their own tail, which reads as an unconditional early return on whichever
+// platform is being compiled.
+#[cfg(target_os = "linux")]
+fn local_audio_devices_json() -> Result<String> {
+    let devices = ultidesk_platform_linux::audio_devices::enumerate()?;
+    tracing::info!(count = devices.len(), "enumerated PipeWire audio endpoints");
+    Ok(serde_json::to_string_pretty(&devices)?)
+}
+
+#[cfg(windows)]
+fn local_audio_devices_json() -> Result<String> {
+    let devices = ultidesk_platform_windows::audio_devices::enumerate()?;
+    tracing::info!(count = devices.len(), "enumerated WASAPI audio endpoints");
+    Ok(serde_json::to_string_pretty(&devices)?)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn local_audio_devices_json() -> Result<String> {
+    anyhow::bail!("audio device enumeration is not implemented for this platform")
 }
 
 /// Stream this machine's audio output to a peer (Linux/PipeWire source side).

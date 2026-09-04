@@ -26,6 +26,7 @@
 //! session bus. Capture and input injection are not implemented yet; their entry
 //! points return [`InputError::Unsupported`] rather than pretending to work.
 
+pub mod audio_devices;
 pub mod caps;
 pub mod input_capture;
 pub mod keymap;

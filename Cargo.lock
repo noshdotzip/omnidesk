@@ -4879,6 +4879,8 @@ dependencies = [
  "serde",
  "serde_json",
  "ultidesk-core",
+ "ultidesk-platform-linux",
+ "ultidesk-platform-windows",
  "ultidesk-topology",
 ]
 
@@ -4899,6 +4901,7 @@ dependencies = [
  "libspa-sys",
  "pipewire",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracing",
  "ultidesk-platform-windows",

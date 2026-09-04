@@ -50,12 +50,28 @@ pub fn f32_to_i16(sample: f32) -> i16 {
 
 /// Start capturing the default render endpoint's loopback.
 pub fn spawn_loopback_capture() -> Result<LoopbackStream, LoopbackError> {
+    spawn_loopback_capture_on(None)
+}
+
+/// Start capturing a specific render endpoint's loopback, by endpoint id.
+///
+/// `None` means the default endpoint, and *follows* it: WASAPI resolves the default at
+/// activation, so this is the right choice when the operator has not picked a device.
+/// Passing an id from [`crate::audio_devices::enumerate`] pins the capture to that
+/// endpoint instead.
+///
+/// The distinction matters as soon as a machine has more than one output: without it a
+/// route that names the HDMI output would silently capture the speakers.
+pub fn spawn_loopback_capture_on(
+    endpoint_id: Option<&str>,
+) -> Result<LoopbackStream, LoopbackError> {
     #[cfg(windows)]
     {
-        imp::spawn_loopback_capture()
+        imp::spawn_loopback_capture(endpoint_id.map(str::to_owned))
     }
     #[cfg(not(windows))]
     {
+        let _ = endpoint_id;
         Err(LoopbackError::Unsupported)
     }
 }
@@ -85,7 +101,9 @@ mod imp {
         LoopbackError::Wasapi(e.to_string())
     }
 
-    pub fn spawn_loopback_capture() -> Result<LoopbackStream, LoopbackError> {
+    pub fn spawn_loopback_capture(
+        endpoint_id: Option<String>,
+    ) -> Result<LoopbackStream, LoopbackError> {
         let (fmt_tx, fmt_rx) = mpsc::channel::<Result<(u32, u16), String>>();
         let (sample_tx, sample_rx) = mpsc::channel::<Vec<i16>>();
 
@@ -104,9 +122,20 @@ mod imp {
                         let enumerator: IMMDeviceEnumerator =
                             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                                 .map_err(wasapi)?;
-                        let device = enumerator
-                            .GetDefaultAudioEndpoint(eRender, eConsole)
-                            .map_err(wasapi)?;
+                        // An explicit id pins the capture; no id follows the default,
+                        // which is what an operator who has not chosen expects.
+                        let device = match endpoint_id.as_deref() {
+                            Some(id) => {
+                                let wide: Vec<u16> =
+                                    id.encode_utf16().chain(std::iter::once(0)).collect();
+                                enumerator
+                                    .GetDevice(windows::core::PCWSTR(wide.as_ptr()))
+                                    .map_err(wasapi)?
+                            }
+                            None => enumerator
+                                .GetDefaultAudioEndpoint(eRender, eConsole)
+                                .map_err(wasapi)?,
+                        };
                         let client: IAudioClient =
                             device.Activate(CLSCTX_ALL, None).map_err(wasapi)?;
 
