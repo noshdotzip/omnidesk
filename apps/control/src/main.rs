@@ -19,6 +19,7 @@
 //! than showing plausible placeholders.
 
 mod devices;
+mod monitors;
 
 use devices::MachineAudio;
 use dioxus::prelude::*;
@@ -55,10 +56,29 @@ struct Machines {
     remote: DeviceId,
 }
 
-/// Placeholder monitors so the editor is usable before topology IPC exists.
+/// The peer's placeholder screen, until the settings IPC can carry a real one.
 ///
-/// Deliberately two devices with differently sized screens: an editor that only ever
-/// sees identical monitors hides most of the bugs worth catching.
+/// Deliberately a different size from any local monitor: an editor that only ever sees
+/// identical screens hides most of the bugs worth catching.
+fn peer_placeholder(device_id: DeviceId) -> Monitor {
+    Monitor {
+        device_id,
+        monitor_id: MonitorId(1),
+        friendly_name: "Peer (not connected)".into(),
+        logical_x: 0.0,
+        logical_y: 0.0,
+        logical_width: 1920.0,
+        logical_height: 1080.0,
+        native_pixel_width: 1920,
+        native_pixel_height: 1080,
+        scale_factor: 1.0,
+        rotation: Rotation::Landscape,
+        refresh_rate: None,
+        primary: false,
+    }
+}
+
+/// Placeholder monitors, used only when the toolkit reports no displays at all.
 fn demo_layout(m: &Machines) -> Layout {
     Layout::new(vec![
         Monitor {
@@ -73,7 +93,7 @@ fn demo_layout(m: &Machines) -> Layout {
             native_pixel_height: 1109,
             scale_factor: 1.0,
             rotation: Rotation::Landscape,
-            refresh_rate: 60.0,
+            refresh_rate: Some(60.0),
             primary: true,
         },
         Monitor {
@@ -88,7 +108,7 @@ fn demo_layout(m: &Machines) -> Layout {
             native_pixel_height: 1080,
             scale_factor: 1.0,
             rotation: Rotation::Landscape,
-            refresh_rate: 144.0,
+            refresh_rate: Some(144.0),
             primary: false,
         },
     ])
@@ -160,7 +180,27 @@ fn Displays() -> Element {
         local: DeviceId::new(),
         remote: DeviceId::new(),
     });
-    let mut layout = use_signal(|| demo_layout(&machines));
+    let window = dioxus::desktop::use_window();
+    // Real monitors, read once on mount. They do not change while the editor is open
+    // often enough to justify watching for hotplug before the settings IPC exists.
+    let mut layout = use_signal(|| {
+        let mut found = monitors::local_monitors(&window, machines.local);
+        if found.is_empty() {
+            // A headless or unreadable session. Falling back keeps the editor usable
+            // and, because the names differ, makes it obvious these are not real.
+            return demo_layout(&machines);
+        }
+        // Placed to the right of everything local, which is the arrangement the
+        // barrier code already assumes. The operator drags it where it belongs.
+        let right = found
+            .iter()
+            .map(|m| m.right())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut peer = peer_placeholder(machines.remote);
+        peer.logical_x = right;
+        found.push(peer);
+        Layout::new(found)
+    });
     let mut dragging = use_signal(|| None::<(usize, f64, f64)>);
 
     // Measured from the DOM rather than assumed; see CANVAS_W_FALLBACK.
@@ -241,7 +281,15 @@ fn Displays() -> Element {
                     },
                     div { class: "name", "{m.friendly_name}" }
                     div { class: "meta",
-                        "{m.native_pixel_width}×{m.native_pixel_height} · {m.refresh_rate:.0} Hz"
+                        match m.refresh_rate {
+                            Some(hz) => format!(
+                                "{}×{} · {:.0} Hz",
+                                m.native_pixel_width, m.native_pixel_height, hz
+                            ),
+                            // Linux reports no video modes, so the size stands alone
+                            // rather than being padded with an invented rate.
+                            None => format!("{}×{}", m.native_pixel_width, m.native_pixel_height),
+                        }
                     }
                     if m.primary {
                         div { class: "badge", "primary" }

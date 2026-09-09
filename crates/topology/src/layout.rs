@@ -272,7 +272,7 @@ mod tests {
             native_pixel_height: h as u32,
             scale_factor: 1.0,
             rotation: Rotation::Landscape,
-            refresh_rate: 60.0,
+            refresh_rate: Some(60.0),
             primary: false,
         }
     }

@@ -31,7 +31,12 @@ pub struct Monitor {
     pub native_pixel_height: u32,
     pub scale_factor: f64,
     pub rotation: Rotation,
-    pub refresh_rate: f32,
+    /// Refresh rate in Hz, when the platform will report one.
+    ///
+    /// `None` rather than a plausible default: `tao` cannot read video modes on Linux
+    /// at all, and filling in 60.0 there would put a number on screen that was never
+    /// measured. Nothing in the layout math consults this — it is display only.
+    pub refresh_rate: Option<f32>,
     pub primary: bool,
 }
 
