@@ -51,13 +51,14 @@ device identities. Pairing (a six-digit code compared on both screens), revocati
 by fingerprint, before reaching any dispatcher. Details and the exact measurements are in
 [docs/status.md](docs/status.md).
 
-Two things this did **not** finish, both deliberate:
+The two machines are now **paired for real and talking both ways** over the Wi-Fi link:
+matching codes on both screens, 8 Ping/Pong round trips each direction, and a third
+unpaired identity refused at the handshake. Measurements in
+[docs/status.md](docs/status.md).
 
-- **Pointer motion still rides the ordered control stream.** ADR-0002 calls for
-  datagrams, and QUIC provides them; it matters when the KVM daemon streams motion, not
-  before.
-- **It has never run between the two machines.** Both ends of every measured run were on
-  the Windows box. That makes it a verified protocol and an unverified link.
+One thing this did **not** finish, deliberately: **pointer motion still rides the ordered
+control stream.** ADR-0002 calls for datagrams and QUIC provides them; it matters when
+the KVM daemon streams motion, not before.
 
 The plaintext TCP transport is still present as `serve-peer-dev`, kept for bench
 comparison. It should be deleted once item 3 runs on the real channel.
@@ -167,17 +168,18 @@ as a deliberate later decision rather than something to attempt in passing.
 
 **Ordered by how much they hold back.**
 
-1. ~~**No secure transport.**~~ **Resolved 2026-09-09.** What replaces it as the top
-   blocker is that it has never carried a byte between the two *machines*: the protocol
-   is verified, the link is not. One cross-machine `pair` plus `peer-ping` would settle
-   it, and needs someone at the Arch machine.
+1. ~~**No secure transport.**~~ **Resolved and verified cross-machine 2026-09-09.** Both
+   machines are paired and carry traffic both ways. What replaces it at the top of this
+   list is **no per-peer permissions**: a paired peer may send every request the
+   dispatcher accepts, so "may control my input" and "may read my clipboard" are the same
+   decision. Source-side enforcement is designed in docs/permissions.md and not built.
 
-2. ~~**No device identity or pairing.**~~ **Resolved 2026-09-09.** `DeviceId` is derived
-   from an Ed25519 public key, and two agents have paired for real over the live channel
-   (`ultidesk-identity`, [ADR-0012](docs/adrs/0012-device-identity.md)). What is left of
-   it: the private key is still a plain file rather than DPAPI / Secret Service, and it
-   is unrestricted on Windows, which has no mode bits. Any process running as this user
-   can read it.
+2. ~~**No device identity or pairing.**~~ **Resolved 2026-09-09**, and the two real
+   machines are paired (`ultidesk-identity`,
+   [ADR-0012](docs/adrs/0012-device-identity.md)). What is left of it: the private key is
+   still a plain file rather than DPAPI / Secret Service. `0600` on Arch, confirmed on
+   the machine; unrestricted on Windows, which has no mode bits, so any process running
+   as this user can read it.
 
 3. **No local IPC on Linux.** `pipe.rs` is Windows-only. The control app cannot ask the
    agent anything on Linux, so every peer-side panel stays a placeholder.
@@ -198,7 +200,10 @@ as a deliberate later decision rather than something to attempt in passing.
 
 ### Waiting on someone at the Arch machine
 
-- `sudo usermod -aG input $USER`, then re-login — unblocks evdev capture.
+- `sudo usermod -aG input $USER`, then re-login — unblocks evdev capture. **Attempted
+  over SSH 2026-09-09 and could not be done**: `sudo` on that machine requires a
+  password. Everything else on the Arch side — building, testing, the identity, pairing
+  and both ping directions — was completed remotely.
 - One ScreenCast picker approval — establishes the `restore_token`, and also confirms the
   scroll sign conventions, which are currently derived from documentation rather than
   measured.

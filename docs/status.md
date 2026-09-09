@@ -513,16 +513,63 @@ script overrides whatever compiler cc-rs found and asks for `clang` by name, bec
 cannot assemble its AArch64 sources. LLVM 22.1.8 was installed on the Windows machine for
 this; the Arch machine already had clang.
 
+## Verified: the two machines are paired and talking (2026-09-09)
+
+The transport section above was measured entirely on loopback. This is the same code
+between the two real machines, over the 5 GHz Wi-Fi link (Windows ARM64 at
+`192.168.137.175`, Arch x64 at `192.168.137.9`, power save confirmed `off`, -45 dBm,
+1.2 Gb/s negotiated).
+
+- **Arch builds and passes the same suite.** `cargo build --workspace` clean,
+  `cargo test --workspace` -> **332 tests**, the same total as Windows ARM64 despite a
+  different distribution: Linux loses the named-pipe loopback test and gains the
+  `0600` file-mode test. `cargo clippy --all-targets -D warnings` and `cargo fmt --check`
+  clean on both — this time without needing a fix, unlike the last Linux run.
+- **Arch has an identity**: fingerprint `7BAB-CD56-D896-A2A1-1BD0`, key file
+  `~/.config/ultidesk/identity.json` created `-rw-------`. That is the Unix mode rule
+  observed on a real machine rather than only in a unit test.
+- **Pairing across the link.** Arch listened, Windows dialled. Both sides were held at
+  the confirmation prompt so the codes could be compared *before* either was told to
+  trust the other: both showed `264 511`, and each then pinned the other's key under an
+  operator-chosen name. The keys stored match each machine's own reported public key.
+- **Both directions carry traffic.** 8 Ping/Pong round trips each way through the real
+  dispatcher over the authenticated channel:
+
+  | direction | min | avg | max |
+  | --- | --- | --- | --- |
+  | Windows -> Arch | 7.8 ms | 39.3 ms | 48.1 ms |
+  | Arch -> Windows | 8.3 ms | 26.6 ms | 46.9 ms |
+  | ICMP, same window | 5 ms | 34 ms | 96 ms |
+
+  The ICMP row is the point: the QUIC path is not the dominant cost. The link is, which
+  is what the 2026-09-04 measurements already concluded — and it is why no input-latency
+  figure quoted from this desk means anything until the machine is on the wire.
+- **A stranger is refused across the link too.** A third identity on the Arch machine,
+  given the same peer list so the only difference was that Windows had not pinned it, was
+  refused during the handshake. Windows logged
+  `peer 1728-E0B3-... is not paired with this device (1 paired)` and the stranger read the
+  same text back through the TLS alert.
+- The Arch agent chose **uinput** (`injector=uinput (no permission dialog)`), so it served
+  the channel with nobody at the machine and no dialog anywhere.
+- The Arch server identified its peer by the **name chosen at pairing**
+  (`peer=windows-arm64`), not by an address or a uuid.
+
+No inbound firewall rule had to be added on Windows: allow rules for
+`ultidesk-agent.exe` already existed from the TCP-era work, and they name the binary
+rather than a port or protocol, so they carried over to QUIC's UDP unchanged.
+
+**Still blocked, and still needs a person at the Arch machine**: `sudo` there requires a
+password, so `sudo usermod -aG input $USER` could not be run. `input-devices` still
+reports the permission error, and evdev capture — the last piece the KVM daemon needs —
+stays unavailable.
+
 ## Exact next step
 
-Milestone 1 continues. Identity, pinning, pairing and the authenticated channel are
-built; what is left of the milestone is **discovery** (mDNS plus the manual IP entry that
-already works), **OS secret storage** for the device key, and **per-peer permissions**.
+Milestone 1 continues. Identity, pinning, pairing and the authenticated channel are built
+and now verified between the two machines; what is left of the milestone is **discovery**
+(mDNS plus the manual IP entry that already works), **OS secret storage** for the device
+key, and **per-peer permissions** — pairing is currently all-or-nothing.
 
-Before any of that, two runs that need someone at the Arch machine and would change what
-is known rather than what is written:
-
-1. Pair the two machines for real and `peer-ping` across the Wi-Fi link. Everything
-   above was loopback.
-2. `sudo usermod -aG input $USER` and re-login, which unblocks evdev capture — the last
-   piece the KVM daemon (next.md item 3) needs.
+The one thing still waiting on a person: `sudo usermod -aG input $USER` on the Arch
+machine, then a re-login. That unblocks evdev capture, which is the last missing piece of
+the KVM daemon (next.md item 3).
