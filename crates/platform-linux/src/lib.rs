@@ -40,6 +40,7 @@ pub mod portal_call;
 pub mod remote_desktop;
 pub mod request;
 pub mod screen_cast;
+pub mod uinput;
 
 pub use caps::{DeviceTypes, SourceTypes};
 pub use portal::{probe, PortalError, PortalReport};

@@ -37,6 +37,10 @@ libspa-sys = "0.10"
 # arbitrates capture -- it carries no input events -- so without a libei client the
 # barriers fire and nothing arrives.
 reis = { version = "0.7", features = ["tokio"] }
+# Virtual input devices through /dev/uinput, and (behind the input group) reading the
+# real ones. This is the portal-free path: no permission dialog, and on a normal
+# desktop login logind already grants an ACL on /dev/uinput.
+evdev = "0.13"
 # reis' event stream is a `futures::Stream`, and the handshake is async.
 futures-util = "0.3"
 tokio = { version = "1", features = ["net", "rt"] }

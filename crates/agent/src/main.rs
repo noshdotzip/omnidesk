@@ -10,6 +10,9 @@
 //!                              (No IPC, no elevation — a quick feasibility probe.)
 //!   ultidesk-agent probe       Print what the local desktop can actually do, as JSON.
 //!                              Linux only; read-only, raises no permission dialog.
+//!   ultidesk-agent uinput-test Move the pointer through a square using virtual
+//!                              input devices. Linux only. Raises NO permission
+//!                              dialog and DOES move the real cursor.
 //!   ultidesk-agent kvm-source  Capture this desktop's input at a screen edge and
 //!                              drive a peer with it. Linux only. GRABS INPUT — press
 //!                              Esc to release.
@@ -32,6 +35,8 @@ mod pipe;
 #[cfg(target_os = "linux")]
 mod portal_injector;
 mod tcp;
+#[cfg(target_os = "linux")]
+mod uinput_injector;
 
 use anyhow::Result;
 use ipc::Injector;
@@ -51,6 +56,7 @@ fn main() -> Result<()> {
         "kvm-demo" => kvm_demo(),
         "kvm-mirror" => kvm_mirror(),
         "kvm-handoff" => kvm_handoff(),
+        "uinput-test" => uinput_test(),
         "kvm-source" => kvm_source(),
         "audio-devices" => audio_devices(),
         "audio-send" => audio_send(),
@@ -59,7 +65,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -380,11 +386,35 @@ fn serve_peer_dev() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
+        // uinput first: it needs no permission dialog, so an agent started at login can
+        // accept input without anyone being at the machine, and its pointer is absolute
+        // rather than dead-reckoned through libinput's acceleration curve. The portal
+        // remains the fallback for a machine where /dev/uinput is not writable.
+        //
+        // `ULTIDESK_FORCE_PORTAL=1` selects the portal explicitly, which is how the two
+        // paths get compared without rebuilding.
+        let force_portal = std::env::var("ULTIDESK_FORCE_PORTAL").is_ok();
+        if !force_portal {
+            match uinput_injector::UinputInjector::open() {
+                Ok(injector) => {
+                    println!("injector=uinput (no permission dialog)");
+                    tracing::info!("uinput devices ready; peers may now inject input");
+                    return rt.block_on(tcp::serve(bind, token, std::sync::Arc::new(injector)));
+                }
+                Err(e) => {
+                    // Reported rather than silently downgraded: falling back to a path
+                    // that raises a dialog changes whether the agent can run unattended,
+                    // which the operator needs to know about.
+                    eprintln!("uinput unavailable ({e}); falling back to the portal");
+                }
+            }
+        }
         let restore = std::env::var("ULTIDESK_RESTORE_TOKEN").ok();
         let injector = portal_injector::PortalInjector::open(restore)?;
         if let Some(t) = injector.restore_token() {
             println!("restore_token={t}");
         }
+        println!("injector=portal");
         tracing::info!("portal session ready; peers may now inject input");
         rt.block_on(tcp::serve(bind, token, std::sync::Arc::new(injector)))
     }
@@ -691,6 +721,73 @@ fn to_wire(e: ultidesk_platform_linux::ei_client::CapturedInput) -> crate::forwa
 #[cfg(not(target_os = "linux"))]
 fn kvm_source() -> Result<()> {
     anyhow::bail!("kvm-source drives the XDG InputCapture portal and libei; it is Linux-only")
+}
+
+/// Drive the real pointer with virtual input devices, with no portal involved.
+///
+/// The point of this subcommand is what it *does not* do: no session, no D-Bus, no
+/// permission dialog. If the cursor moves, injection works unattended, which is the
+/// requirement a KVM that is left running actually has.
+///
+/// Deliberately motion-only. Clicks and keystrokes would land in whatever window has
+/// focus, and a probe should not be able to type into someone's editor.
+#[cfg(target_os = "linux")]
+fn uinput_test() -> Result<()> {
+    use ultidesk_platform_linux::uinput::{normalise, UinputDevices};
+
+    println!("Creating virtual input devices (no permission dialog should appear)...");
+    let mut devices = UinputDevices::open()?;
+    println!("Devices created and settled.");
+
+    // With an explicit delta, make that one move and stop. Used to drive the pointer to
+    // a known place so a screenshot can confirm it actually arrived — "the write
+    // succeeded" and "the compositor moved the cursor" are different claims.
+    let px: i32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    let py: i32 = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    let w: i32 = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1920);
+    let h: i32 = std::env::args()
+        .nth(5)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1080);
+    if px >= 0 && py >= 0 {
+        devices.pointer_position(normalise(px, w), normalise(py, h))?;
+        println!("placed at {px},{py} of {w}x{h}");
+        return Ok(());
+    }
+
+    // A square traced in absolute coordinates across the middle of the desktop.
+    let (w, h) = (1920, 1080);
+    let corners = [(600, 300), (1300, 300), (1300, 800), (600, 800), (600, 300)];
+    for i in 0..corners.len() - 1 {
+        let (x0, y0) = corners[i];
+        let (x1, y1) = corners[i + 1];
+        // Stepped rather than jumped: a teleport does not show that continuous motion
+        // works, and continuous motion is what a KVM produces.
+        for s in 0..=20 {
+            let x = x0 + (x1 - x0) * s / 20;
+            let y = y0 + (y1 - y0) * s / 20;
+            devices.pointer_position(normalise(x, w), normalise(y, h))?;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        println!("to {x1},{y1}");
+    }
+
+    println!("Done. If the cursor traced a square, uinput injection works unattended.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uinput_test() -> Result<()> {
+    anyhow::bail!("uinput-test drives /dev/uinput and is Linux-only")
 }
 
 /// Print the machine's audio endpoints as JSON.
