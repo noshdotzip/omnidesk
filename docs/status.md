@@ -1,6 +1,6 @@
 # Ultidesk status
 
-Honest snapshot of what is built, verified, and not. Updated 2026-09-04.
+Honest snapshot of what is built, verified, and not. Updated 2026-09-09.
 
 ## Milestone position
 
@@ -227,7 +227,7 @@ Built with Dioxus 0.6 desktop ([ADR-0010](adrs/0010-dioxus-control-ui.md)) and r
 **natively** on `aarch64-pc-windows-msvc`; the renderer is WebView2, confirmed by the
 `webview2-com` dependency rather than assumed.
 
-- `cargo test --workspace` -> **233 tests pass** on Windows ARM64 and on Arch x64.
+- `cargo test --workspace` -> **258 tests pass** on Windows ARM64 and on Arch x64.
   Clippy `-D warnings` and `cargo fmt --check` clean on both.
 - **Display arrangement**: monitors drag and snap; overlaps are flagged; shared borders
   are listed. All geometry comes from `ultidesk-topology::layout` so the editor cannot
@@ -326,6 +326,62 @@ measurement that is meant to be quoted.
 
 Note `iw` is not installed; the readings above came from `iwconfig` (net-tools) and
 `ping`.
+
+## Verified: real monitors and settings that stick (2026-09-09)
+
+The control UI no longer shows a demo layout, and what the operator arranges survives
+a restart.
+
+**Monitors are read from the platform.** Enumerated through `tao`, which the toolkit
+already provides on both platforms, rather than `EnumDisplayMonitors` plus a Wayland
+output listener — two backends would be two chances to disagree about the coordinate
+space, and agreeing with it is this editor's whole job.
+
+- Windows ARM64 reads `\\.\DISPLAY1` as **2496x1664 at 120 Hz**, which is the
+  1664x1109 logical desktop at its actual 150%% scale.
+- Arch reads `eDP-1-0x82ED` at **1920x1080 with no refresh rate**, because `tao`
+  documents `video_modes()` as unsupported on Linux and it always yields nothing.
+  `refresh_rate` is therefore `Option`; filling in a plausible 60 Hz would put an
+  unmeasured number on screen.
+
+Positions and sizes are stored exactly as reported, deliberately **not** divided by
+each monitor's scale factor. That division looks right on a single-monitor machine and
+breaks as soon as two monitors differ: the virtual desktop is one coordinate space, so
+a 100%% and a 150%% monitor sitting edge to edge share an exact boundary in it.
+Rescaling each by its own factor turns that boundary into a gap or an overlap,
+`adjacency` then reports no shared border, and the pointer can never cross. It would
+only appear on mixed-DPI desks — which is exactly where nobody tests.
+
+**Settings persist**, and doing so forced an identity bug into the open: the control
+app minted a fresh random `DeviceId` on every launch, twice, so the Displays tab and
+the Audio tab disagreed about which machine was "this machine". Nothing depended on it
+until a saved route did. The id is now generated once and shared — a placeholder for
+the Ed25519 identity in Milestone 1, not a substitute for it.
+
+Restoring is a match keyed by **monitor name, never by index**. The parallel-walk
+implementation is wrong the first time a monitor is unplugged: every monitor after it
+shifts up one and inherits its neighbour's position, silently. Saved entries are hints
+and never a source of monitors, so a saved name that is no longer attached is dropped
+rather than resurrected as a ghost screen claiming an edge.
+
+Verified end to end on both machines:
+
+- Windows: dragged the peer, confirmed the position in `settings.json`, restarted, and
+  it came back where it was left — overlapping, which the editor then flagged while
+  correctly reporting no shared border.
+- Arch: seeded `~/.config/ultidesk/settings.json` with the peer to the *left*, and it
+  restored there with the shared border correctly reading `Left`. `XDG_CONFIG_HOME` is
+  unset in that session, so this exercised the `HOME` fallback rather than the XDG
+  path.
+
+Saved audio routes are re-checked through `AudioRouting::add` on load rather than
+trusted, so a stale file cannot reintroduce the feedback loop
+[ADR-0011](adrs/0011-audio-routing-loop-prevention.md) exists to prevent.
+
+Not done: the peer's screen and audio devices are still placeholders, labelled as not
+connected. Both need the settings IPC, which does not exist. On Linux the agent has no
+local IPC transport at all (`pipe.rs` is Windows-only), so that surface needs a Unix
+socket before the control app can ask the agent anything.
 
 ## Blocked
 
