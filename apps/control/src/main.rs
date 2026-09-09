@@ -48,14 +48,17 @@ fn main() {
 
 /// The machines this session knows about.
 ///
-/// The local id comes from the settings file so it is the same across launches *and*
-/// the same in both tabs — each tab used to mint its own, so the Displays tab and the
-/// Audio tab silently disagreed about which machine was "this machine". Nothing
-/// depended on it until saved routes did.
+/// The local id is **derived from this machine's Ed25519 identity**, so it is the same
+/// across launches, the same in both tabs, and the same id the agent uses. It used to
+/// be a random uuid minted per tab, which meant the Displays tab and the Audio tab
+/// silently disagreed about which machine was "this machine"; then it was a random uuid
+/// stored in the settings file, which fixed the disagreement but still named a machine
+/// nobody could verify.
 ///
-/// The remote id is still minted per launch: pairing does not exist, so there is no
-/// peer identity to be stable about yet. It exists so the panels can show the shape of
-/// a two-machine setup, marked as not connected.
+/// The remote id is still minted per launch: pairing exists as a mechanism
+/// (`ultidesk_identity::PeerStore`) but nothing connects yet, so there is no peer
+/// identity to be stable about. It exists so the panels can show the shape of a
+/// two-machine setup, marked as not connected.
 #[derive(Clone)]
 struct Machines {
     local: DeviceId,
@@ -67,6 +70,8 @@ struct Machines {
 struct Session {
     machines: Machines,
     dir: Option<std::path::PathBuf>,
+    /// This machine's identity fingerprint, for the operator to compare when pairing.
+    fingerprint: Option<String>,
     /// Anything the operator should know about the load, e.g. a settings file that
     /// could not be read.
     note: Option<String>,
@@ -75,7 +80,7 @@ struct Session {
 impl Session {
     fn load() -> (Self, settings::Settings) {
         let dir = settings::config_dir();
-        let loaded = match &dir {
+        let mut loaded = match &dir {
             Some(d) => settings::load_from(d),
             // No config directory at all (no HOME, no APPDATA). The app still works;
             // it just cannot remember anything, and says so rather than pretending
@@ -87,12 +92,49 @@ impl Session {
                 ),
             },
         };
+
+        // The identity, not the settings file, decides which machine this is.
+        let identity = dir.as_ref().map(|d| ultidesk_identity::load_or_create(d));
+        let mut fingerprint = None;
+        match identity {
+            Some(Ok(loaded_identity)) => {
+                fingerprint = Some(loaded_identity.identity.fingerprint());
+                if let Some(n) = loaded_identity.note {
+                    loaded.note.get_or_insert(n);
+                }
+                // Carries the saved routes onto the derived id the first time this
+                // build runs against a settings file written by an older one.
+                if loaded
+                    .settings
+                    .adopt_device_id(loaded_identity.identity.device_id())
+                {
+                    if let Some(d) = &dir {
+                        if let Err(e) = settings::save_to(d, &loaded.settings) {
+                            loaded
+                                .note
+                                .get_or_insert(format!("could not save re-keyed settings: {e}"));
+                        }
+                    }
+                }
+            }
+            // A damaged identity file is refused rather than replaced, so the app runs
+            // with a throwaway id and says why. Silently re-keying would un-pair every
+            // peer without telling anyone — see `ultidesk_identity::store`.
+            Some(Err(e)) => {
+                loaded.note.get_or_insert(format!(
+                    "this machine's identity could not be read, so it is unnamed this session: {e}"
+                ));
+            }
+            None => {}
+        }
+
         let session = Session {
             machines: Machines {
                 local: loaded.settings.local_device_id,
                 remote: DeviceId::new(),
             },
             dir,
+            fingerprint,
             note: loaded.note,
         };
         (session, loaded.settings)
@@ -219,6 +261,12 @@ fn App() -> Element {
         div { class: "app",
             if let Some(note) = &session.note {
                 div { class: "warn", "{note}" }
+            }
+            // Shown rather than hidden behind a settings page: pairing works by an
+            // operator comparing this string with the one on the other machine, so it
+            // has to be somewhere they can find without being told where to look.
+            if let Some(fingerprint) = &session.fingerprint {
+                div { class: "note", "This machine's identity: {fingerprint}" }
             }
             div { class: "tabs",
                 button {

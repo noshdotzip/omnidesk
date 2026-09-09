@@ -1,0 +1,20 @@
+[package]
+name = "ultidesk-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ultidesk-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+# Ed25519 signing/verification. Pure Rust, so it adds no C toolchain requirement to a
+# crate that every process links — deliberately unlike the QUIC stack, which does.
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"

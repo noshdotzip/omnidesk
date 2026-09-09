@@ -10,6 +10,8 @@
 //!                              (No IPC, no elevation — a quick feasibility probe.)
 //!   ultidesk-agent probe       Print what the local desktop can actually do, as JSON.
 //!                              Linux only; read-only, raises no permission dialog.
+//!   ultidesk-agent identity    Print this machine's Ed25519 device identity, creating
+//!                              it on first run. Never prints the private key.
 //!   ultidesk-agent uinput-test Move the pointer through a square using virtual
 //!                              input devices. Linux only. Raises NO permission
 //!                              dialog and DOES move the real cursor.
@@ -49,6 +51,7 @@ fn main() -> Result<()> {
     match mode.as_str() {
         "enumerate" => enumerate(),
         "probe" => probe(),
+        "identity" => identity(),
         "inject-test" => inject_test(),
         "capture-test" => capture_test(),
         "cast-test" => cast_test(),
@@ -66,7 +69,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|identity|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -360,6 +363,45 @@ fn cast_test() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn cast_test() -> Result<()> {
     anyhow::bail!("cast-test drives the XDG ScreenCast portal and is Linux-only")
+}
+
+/// Print this machine's device identity, creating it on first run.
+///
+/// The fingerprint is what an operator compares against the other machine's before
+/// trusting it, so it is printed alongside the ids rather than only the ids: a uuid is
+/// unreadable at a glance and two of them differing in the middle look identical.
+///
+/// Read-only apart from the first run, and raises no permission dialog on either
+/// platform.
+fn identity() -> Result<()> {
+    let dir = ultidesk_core::paths::config_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no configuration directory (no APPDATA on Windows, no HOME or XDG_CONFIG_HOME \
+             on Linux); set ULTIDESK_CONFIG_DIR to choose one"
+        )
+    })?;
+    let loaded = ultidesk_identity::load_or_create(&dir)?;
+    if let Some(note) = &loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+
+    let report = serde_json::json!({
+        "device_id": loaded.identity.device_id().to_string(),
+        "fingerprint": loaded.identity.fingerprint(),
+        "public_key": loaded.identity.public().to_string(),
+        "path": ultidesk_identity::store::identity_path(&dir),
+        "created": loaded.created,
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+
+    // The private key is never logged, printed, or included above — only the public
+    // half and the digests derived from it.
+    tracing::info!(
+        created = loaded.created,
+        fingerprint = %loaded.identity.fingerprint(),
+        "device identity ready"
+    );
+    Ok(())
 }
 
 /// Serve the **dev** peer transport so another machine can drive this one's input.

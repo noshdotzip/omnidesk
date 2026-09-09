@@ -1,16 +1,18 @@
 //! Persisting the operator's arrangement and audio routes.
 //!
 //! # Persistence forces a stable identity
-//! Everything here is keyed to a machine, and until now the control app minted a fresh
+//! Everything here is keyed to a machine, and the control app once minted a fresh
 //! random [`DeviceId`] on every launch — twice, in fact, so the Displays tab and the
 //! Audio tab disagreed about which machine was "this machine". Nothing depended on it
 //! before, so nothing broke. A saved file does depend on it: with a new id each launch,
-//! no saved route could ever match a device again. So the id is generated once and
-//! stored here.
+//! no saved route could ever match a device again.
 //!
-//! This is a placeholder for real device identity, not a substitute for it. Milestone 1
-//! derives it from an Ed25519 key; this is an opaque uuid that only has to be stable on
-//! one machine.
+//! The id is now **derived from this machine's Ed25519 identity** (`ultidesk_identity`)
+//! rather than drawn at random, so it is the same id the agent and every peer use, and
+//! it cannot be claimed by a machine that does not hold the private key. What is stored
+//! here is a record of which id the saved routes were written against, so that a file
+//! from before identities existed can be carried across —
+//! see [`Settings::adopt_device_id`].
 //!
 //! # Writes are atomic
 //! A settings file is rewritten on every change. Truncating the real file and then
@@ -37,7 +39,12 @@ const FILE_NAME: &str = "settings.json";
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub version: u32,
-    /// This machine's identity, generated once and then stable.
+    /// Which machine the saved routes below are keyed to.
+    ///
+    /// No longer generated here: it is derived from this machine's Ed25519 identity
+    /// (`ultidesk_identity`), so it is the same id the agent and every peer will use.
+    /// It is still *stored*, because a saved route names it and the file has to record
+    /// which id those routes were written against — see [`Settings::adopt_device_id`].
     pub local_device_id: DeviceId,
     pub layout: SavedLayout,
     pub audio_routes: Vec<Route>,
@@ -45,6 +52,9 @@ pub struct Settings {
 
 impl Settings {
     /// A fresh configuration for a machine that has never saved one.
+    ///
+    /// The id is a placeholder that [`Settings::adopt_device_id`] replaces as soon as
+    /// the real identity is known; nothing is saved against it in between.
     pub fn fresh() -> Self {
         Settings {
             version: SETTINGS_VERSION,
@@ -52,6 +62,36 @@ impl Settings {
             layout: SavedLayout::default(),
             audio_routes: Vec::new(),
         }
+    }
+
+    /// Re-key this machine's saved state onto the id derived from its identity.
+    ///
+    /// Every existing settings file was written when the local id was a random uuid
+    /// minted on first run. Simply overwriting the field would leave every saved audio
+    /// route pointing at a device id that no longer names any machine, and the routes
+    /// would silently vanish from the panel — the operator would see an empty list and
+    /// no reason for it. So the routes are carried across with the id.
+    ///
+    /// Returns whether anything changed, so the caller can save once instead of on
+    /// every launch.
+    pub fn adopt_device_id(&mut self, derived: DeviceId) -> bool {
+        if self.local_device_id == derived {
+            return false;
+        }
+        let previous = self.local_device_id;
+        for route in &mut self.audio_routes {
+            // Only endpoints that belonged to *this* machine move. A route naming a
+            // peer keeps that peer's id, which is the whole reason this is a rewrite
+            // and not a blanket replacement.
+            if route.source.device_id == previous {
+                route.source.device_id = derived;
+            }
+            if route.sink.device_id == previous {
+                route.sink.device_id = derived;
+            }
+        }
+        self.local_device_id = derived;
+        true
     }
 }
 
@@ -64,63 +104,10 @@ pub struct Loaded {
     pub note: Option<String>,
 }
 
-/// The environment `config_dir` reads, named so the rules can be tested without
-/// mutating the real process environment.
-///
-/// Env vars are global to the process and `cargo test` runs tests on parallel threads,
-/// so a test that sets one can change what a concurrently running test sees. Passing
-/// them in makes both platforms' rules deterministic to test, and testable from either
-/// platform rather than only from the one they apply to.
-#[derive(Debug, Default, Clone)]
-pub struct ConfigEnv {
-    pub override_dir: Option<PathBuf>,
-    pub appdata: Option<PathBuf>,
-    pub xdg_config_home: Option<PathBuf>,
-    pub home: Option<PathBuf>,
-}
-
-impl ConfigEnv {
-    /// Read the real environment.
-    pub fn from_process() -> Self {
-        let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
-        ConfigEnv {
-            override_dir: var("ULTIDESK_CONFIG_DIR"),
-            appdata: var("APPDATA"),
-            xdg_config_home: var("XDG_CONFIG_HOME"),
-            home: var("HOME"),
-        }
-    }
-}
-
-/// Where settings live on this platform.
-///
-/// `ULTIDESK_CONFIG_DIR` overrides everything, which is what lets a portable install
-/// keep its configuration beside the binary.
-pub fn config_dir() -> Option<PathBuf> {
-    resolve_config_dir(&ConfigEnv::from_process(), cfg!(windows))
-}
-
-/// The platform rules, as pure logic.
-///
-/// `windows` is passed rather than read from `cfg!` at this level so both branches can
-/// be exercised from either host — the Windows rule is otherwise never tested on Linux
-/// and vice versa, which is exactly how one of them rots.
-pub fn resolve_config_dir(env: &ConfigEnv, windows: bool) -> Option<PathBuf> {
-    if let Some(dir) = &env.override_dir {
-        return Some(dir.clone());
-    }
-    if windows {
-        return env.appdata.as_ref().map(|a| a.join("Ultidesk"));
-    }
-    // The XDG default, with the documented fallback rather than an assumption that
-    // XDG_CONFIG_HOME is always set — on a plain login shell it usually is not.
-    if let Some(x) = &env.xdg_config_home {
-        return Some(x.join("ultidesk"));
-    }
-    env.home
-        .as_ref()
-        .map(|h| h.join(".config").join("ultidesk"))
-}
+// Where settings live is `ultidesk_core::paths`' rule, not this module's: the agent
+// resolves the same directory, and two copies of the rule are two chances to disagree
+// about which machine's configuration is being read.
+pub use ultidesk_core::paths::config_dir;
 
 /// Read settings from `dir`, falling back to a fresh configuration.
 pub fn load_from(dir: &Path) -> Loaded {
@@ -235,6 +222,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn route(source: (DeviceId, &str), sink: (DeviceId, &str)) -> Route {
+        use ultidesk_topology::DeviceKey;
+        Route {
+            source: DeviceKey {
+                device_id: source.0,
+                node: source.1.to_string(),
+            },
+            sink: DeviceKey {
+                device_id: sink.0,
+                node: sink.1.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn adopting_the_derived_id_carries_this_machines_routes_across() {
+        // The upgrade path for every settings file written before identities existed.
+        let mut s = Settings::fresh();
+        let old = s.local_device_id;
+        let peer = DeviceId::new();
+        s.audio_routes = vec![
+            route((old, "speakers"), (peer, "peer-sink")),
+            route((peer, "peer-mic"), (old, "headset")),
+        ];
+
+        let derived = DeviceId::new();
+        assert!(s.adopt_device_id(derived));
+
+        assert_eq!(s.local_device_id, derived);
+        assert_eq!(s.audio_routes[0].source.device_id, derived);
+        assert_eq!(s.audio_routes[1].sink.device_id, derived);
+        assert_eq!(
+            s.audio_routes[0].sink.device_id, peer,
+            "a peer's id is not this machine's and must not be rewritten"
+        );
+        assert_eq!(s.audio_routes[1].source.device_id, peer);
+        assert_eq!(
+            s.audio_routes[0].source.node, "speakers",
+            "nodes are opaque"
+        );
+    }
+
+    #[test]
+    fn adopting_the_same_id_changes_nothing_and_says_so() {
+        // Reported so the app saves once at the upgrade rather than on every launch.
+        let mut s = Settings::fresh();
+        let id = s.local_device_id;
+        let before = s.clone();
+        assert!(!s.adopt_device_id(id));
+        assert_eq!(s, before);
     }
 
     #[test]
@@ -357,90 +396,6 @@ mod tests {
         let nested = d.path().join("deeper").join("still");
         save_to(&nested, &Settings::fresh()).unwrap();
         assert!(nested.join(FILE_NAME).exists());
-    }
-
-    fn env(
-        over: Option<&str>,
-        appdata: Option<&str>,
-        xdg: Option<&str>,
-        home: Option<&str>,
-    ) -> ConfigEnv {
-        ConfigEnv {
-            override_dir: over.map(PathBuf::from),
-            appdata: appdata.map(PathBuf::from),
-            xdg_config_home: xdg.map(PathBuf::from),
-            home: home.map(PathBuf::from),
-        }
-    }
-
-    #[test]
-    fn the_override_wins_on_both_platforms() {
-        // What a portable install relies on.
-        for windows in [true, false] {
-            let e = env(
-                Some("/portable"),
-                Some("C:/AppData"),
-                Some("/xdg"),
-                Some("/home/n"),
-            );
-            assert_eq!(
-                resolve_config_dir(&e, windows),
-                Some(PathBuf::from("/portable")),
-                "override ignored (windows={windows})"
-            );
-        }
-    }
-
-    #[test]
-    fn windows_uses_appdata() {
-        let e = env(None, Some("C:/Users/n/AppData/Roaming"), None, None);
-        assert_eq!(
-            resolve_config_dir(&e, true),
-            Some(PathBuf::from("C:/Users/n/AppData/Roaming").join("Ultidesk"))
-        );
-    }
-
-    #[test]
-    fn linux_prefers_xdg_config_home() {
-        let e = env(None, None, Some("/home/n/.config"), Some("/home/n"));
-        assert_eq!(
-            resolve_config_dir(&e, false),
-            Some(PathBuf::from("/home/n/.config").join("ultidesk"))
-        );
-    }
-
-    #[test]
-    fn linux_falls_back_to_home_when_xdg_is_unset() {
-        // On a plain login shell XDG_CONFIG_HOME usually is not set, so this fallback
-        // is the common path rather than an edge case.
-        let e = env(None, None, None, Some("/home/n"));
-        assert_eq!(
-            resolve_config_dir(&e, false),
-            Some(PathBuf::from("/home/n/.config/ultidesk"))
-        );
-    }
-
-    #[test]
-    fn no_home_and_no_appdata_means_no_config_directory() {
-        // Reported as None so the app can say it cannot save, rather than writing to
-        // the current working directory and scattering settings files around.
-        assert_eq!(resolve_config_dir(&ConfigEnv::default(), true), None);
-        assert_eq!(resolve_config_dir(&ConfigEnv::default(), false), None);
-    }
-
-    #[test]
-    fn windows_does_not_consult_xdg_and_linux_does_not_consult_appdata() {
-        // Each platform ignoring the other's variable is what keeps a cross-platform
-        // dev box from resolving to a surprising directory.
-        let e = env(None, Some("C:/AppData"), Some("/xdg"), None);
-        assert_eq!(
-            resolve_config_dir(&e, true),
-            Some(PathBuf::from("C:/AppData").join("Ultidesk"))
-        );
-        assert_eq!(
-            resolve_config_dir(&e, false),
-            Some(PathBuf::from("/xdg").join("ultidesk"))
-        );
     }
 
     fn uuid_text() -> String {
