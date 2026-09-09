@@ -1,6 +1,7 @@
 # What's next
 
-Written 2026-09-09, after the uinput/evdev sprint. Companion to
+Written 2026-09-09 after the uinput/evdev sprint; revised the same day after the
+identity and transport work landed. Companion to
 [docs/status.md](docs/status.md), which records what is *verified*; this one records
 what I would build next and what is genuinely in the way.
 
@@ -22,6 +23,9 @@ owns that edge, grabs input, streams it, and hands back on the return crossing.
 joins them to a live pointer and a connection. Today that only exists as demo
 subcommands driven by hand.
 
+As of 2026-09-09 the connection those subcommands should be using now exists and is
+authenticated, so the assembly no longer has to be built twice.
+
 **2. Dragging windows between machines — least complete.**
 
 Capture is real: zero-copy DMA-BUF, per-window, verified. Everything after it is
@@ -39,26 +43,24 @@ TCP, and Linux playback shells out to `pw-play`.
 
 ## What I would build next, in order
 
-### 1. The secure peer transport (ADR-0002)
+### 1. ~~The secure peer transport (ADR-0002)~~ — **done 2026-09-09**
 
-Everything cross-machine currently runs over **plaintext TCP gated by a shared token**,
-including keystrokes. That is fine for a bench on a trusted LAN and is not shippable in
-any other sense. It also blocks the rest of this list: pairing and the settings IPC both
-want a real channel to sit on, and building them against the dev transport means
-building them twice.
+`ultidesk-transport`: QUIC over TLS 1.3, mutually authenticated, pinned to Ed25519
+device identities. Pairing (a six-digit code compared on both screens), revocation,
+`serve-peer` and `peer-ping` all work; an unpaired machine is refused at the handshake,
+by fingerprint, before reaching any dispatcher. Details and the exact measurements are in
+[docs/status.md](docs/status.md).
 
-This is first not because it is the most interesting but because everything else
-inherits from it.
+Two things this did **not** finish, both deliberate:
 
-**Identity for it now exists** (`ultidesk-identity`, 2026-09-09): the keys to pin, the
-store to pin them in, and the pairing code are built and tested. What is missing is the
-channel that presents them.
+- **Pointer motion still rides the ordered control stream.** ADR-0002 calls for
+  datagrams, and QUIC provides them; it matters when the KVM daemon streams motion, not
+  before.
+- **It has never run between the two machines.** Both ends of every measured run were on
+  the Windows box. That makes it a verified protocol and an unverified link.
 
-**A toolchain note found while starting it.** `quinn`/`rustls` reach `ring`, and ring's
-build script *hard-requires clang* on `aarch64-pc-windows-msvc` — it overrides whatever
-compiler cc-rs found and asks for `clang` by name, because MSVC cannot assemble its
-AArch64 sources. So the QUIC stack does not build on the Windows ARM64 machine until
-LLVM is installed there. The Arch machine already has clang.
+The plaintext TCP transport is still present as `serve-peer-dev`, kept for bench
+comparison. It should be deleted once item 3 runs on the real channel.
 
 ### 2. Local IPC on Linux, then the settings IPC
 
@@ -165,16 +167,17 @@ as a deliberate later decision rather than something to attempt in passing.
 
 **Ordered by how much they hold back.**
 
-1. **No secure transport.** Plaintext TCP with a shared token carries every keystroke
-   today. Blocks shipping anything, and blocks building pairing and settings IPC once
-   rather than twice.
+1. ~~**No secure transport.**~~ **Resolved 2026-09-09.** What replaces it as the top
+   blocker is that it has never carried a byte between the two *machines*: the protocol
+   is verified, the link is not. One cross-machine `pair` plus `peer-ping` would settle
+   it, and needs someone at the Arch machine.
 
-2. ~~**No device identity or pairing.**~~ **Resolved 2026-09-09** for the offline half:
-   `DeviceId` is now derived from an Ed25519 public key, and pinning plus the six-digit
-   pairing code are built and tested (`ultidesk-identity`,
-   [ADR-0012](docs/adrs/0012-device-identity.md)). What remains needs blocker 1: no key
-   has ever been exchanged, so no peer has been pinned outside a unit test. The private
-   key is also still a plain file rather than DPAPI / Secret Service.
+2. ~~**No device identity or pairing.**~~ **Resolved 2026-09-09.** `DeviceId` is derived
+   from an Ed25519 public key, and two agents have paired for real over the live channel
+   (`ultidesk-identity`, [ADR-0012](docs/adrs/0012-device-identity.md)). What is left of
+   it: the private key is still a plain file rather than DPAPI / Secret Service, and it
+   is unrestricted on Windows, which has no mode bits. Any process running as this user
+   can read it.
 
 3. **No local IPC on Linux.** `pipe.rs` is Windows-only. The control app cannot ask the
    agent anything on Linux, so every peer-side panel stays a placeholder.
@@ -206,7 +209,9 @@ as a deliberate later decision rather than something to attempt in passing.
 
 Carried here so it is not rediscovered later:
 
-- **Plaintext TCP peer transport.** See blocker 1.
+- **The plaintext TCP peer transport still exists** as `serve-peer-dev`, kept for bench
+  comparison against the QUIC path. Delete it once the KVM daemon runs on the real
+  channel; a dev transport that outlives its purpose is one somebody eventually ships.
 - **`pw-record` / `pw-play` subprocesses** in the audio path, instead of a native
   PipeWire client.
 - **Uncompressed PCM** on the wire, with no jitter buffer.
@@ -215,6 +220,10 @@ Carried here so it is not rediscovered later:
   checking that `XOpenDisplay` succeeded. A normal desktop launch is fine; a pure
   Wayland session with no XWayland is not. Recorded in
   [ADR-0010](docs/adrs/0010-dioxus-control-ui.md).
+- **A paired peer may send every request the dispatcher accepts.** Pairing is currently
+  all-or-nothing: there is no per-peer permission store, so "this machine may control me"
+  and "this machine may read my clipboard" are the same decision. Source-side enforcement
+  is designed in docs/permissions.md and not built.
 - **The peer's placement is persisted by the literal string "Peer (not connected)".**
   Fine while there is one placeholder peer; it needs to become a real device id the
   moment pairing exists.

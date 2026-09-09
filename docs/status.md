@@ -460,11 +460,69 @@ hand. The Arch machine has not run `identity` yet, so no second identity exists.
 a normal file on Windows, which has no mode bits. Moving it into DPAPI / the Secret
 Service is Milestone-1 work and has not been done.
 
+## Verified: the authenticated peer transport (2026-09-09)
+
+Executed on `aarch64-pc-windows-msvc`. `ultidesk-transport` is the ADR-0002 channel:
+QUIC over TLS 1.3, mutually authenticated, pinned to the Ed25519 identities above. It
+replaces the plaintext TCP transport for everything except a deliberate bench
+comparison.
+
+- `cargo test --workspace` -> **332 tests pass** (313 before). Clippy `-D warnings` and
+  `cargo fmt --check` clean.
+- **Pairing ran end to end** between two agents with separate identities and separate
+  configuration directories: both sides displayed the same six digits (`709 328`), both
+  pinned the other's key, and each recorded the other's fingerprint under an
+  operator-chosen name.
+- **A paired peer round-tripped Ping/Pong** through the real dispatcher over the
+  authenticated channel: 0.9 / 2.2 / 3.7 ms min/avg/max over loopback.
+- **An unpaired third identity was refused at the handshake**, by fingerprint, and never
+  reached the dispatcher. The server logged
+  `peer F5AE-... is not paired with this device (1 paired)` and the rejected client read
+  the same text back through the TLS alert — so it learns which key to add rather than
+  seeing "connection lost".
+- Seven loopback integration tests pin the security properties: mutual authentication, an
+  unpinned peer refused, an empty pinned set refusing everyone, the *dialling* side
+  checking who answered, both ends deriving the same pairing code, two pairings never
+  sharing a code, and the message-size cap.
+
+Agent surface: `pair` (listen or dial), `peers` (list, `peers forget <key>` revokes),
+`serve-peer`, `peer-ping`.
+
+**Three things the tests found rather than the design**, all now fixed and worth knowing
+before writing anything else on this channel:
+
+1. `finish()` must wait for acknowledgement. Marking a stream finished and dropping the
+   connection discards bytes still in flight; the peer reads "connection lost" instead of
+   the reply that was, from the sender's side, definitely sent.
+2. Streams are served concurrently. Draining them in sequence let one long-lived control
+   stream block the next from ever being read.
+3. A rejected peer is told why. `MessageStream` carries the connection so a stream error
+   can report the connection's close reason.
+
+**Not verified**: nothing has crossed between the two *machines* over this channel. Both
+ends of every run above were on the Windows box, so it exercises the protocol and the
+pinning but not the Wi-Fi link, and the Arch machine has not been paired. The 0.9-3.7 ms
+figures are loopback and say nothing about the real link, where ICMP alone averages
+28 ms after the power-save fix.
+
+**Not built**: QUIC datagrams for pointer motion (everything is on the ordered control
+stream today), discovery (an address is typed in), and per-peer permissions.
+
+**Toolchain**: building this needs **clang** on `aarch64-pc-windows-msvc`. `ring`'s build
+script overrides whatever compiler cc-rs found and asks for `clang` by name, because MSVC
+cannot assemble its AArch64 sources. LLVM 22.1.8 was installed on the Windows machine for
+this; the Arch machine already had clang.
+
 ## Exact next step
 
-Milestone 1 (secure device mesh): persistent Ed25519 identity + OS secret storage,
-mDNS discovery + manual IP fallback, pairing with SAS verification code, pinned peers +
-revocation, per-peer permissions, the authenticated QUIC control channel, capability
-negotiation — which also replaces the dev loopback signaling broker. In parallel, a small
-task to wire Vite so the Milestone-0 projection slice can be manually verified per
-[testing.md](testing.md).
+Milestone 1 continues. Identity, pinning, pairing and the authenticated channel are
+built; what is left of the milestone is **discovery** (mDNS plus the manual IP entry that
+already works), **OS secret storage** for the device key, and **per-peer permissions**.
+
+Before any of that, two runs that need someone at the Arch machine and would change what
+is known rather than what is written:
+
+1. Pair the two machines for real and `peer-ping` across the Wi-Fi link. Everything
+   above was loopback.
+2. `sudo usermod -aG input $USER` and re-login, which unblocks evdev capture — the last
+   piece the KVM daemon (next.md item 3) needs.

@@ -1,7 +1,8 @@
 # Ultidesk protocols
 
 Two contracts exist: the **local IPC** (desktop app ↔ agent) and the **peer protocol**
-(device ↔ device). Only local IPC is implemented in this slice.
+(device ↔ device). The local IPC and the peer *transport* are implemented; the wider peer
+message schema below is not.
 
 ## Versioning
 
@@ -31,6 +32,43 @@ by the discriminated unions in `apps/desktop/src/shared/protocol.ts`:
 
 Safety: bounded message size (`MAX_MESSAGE_BYTES`), and the agent releases all held
 input if the connection drops.
+
+## Peer transport (implemented)
+
+Transport: **QUIC over TLS 1.3** (`crates/transport`, [ADR-0002](adrs/0002-control-transport.md)),
+mutually authenticated and pinned to Ed25519 device identities
+([ADR-0012](adrs/0012-device-identity.md)). One UDP socket serves both roles: a peer
+dials and accepts on the same endpoint.
+
+Authentication is two checks, both required and both run in each direction:
+
+1. the presented certificate carries a public key in this device's pinned set, and
+2. the peer proves possession of the matching private key through the TLS 1.3
+   CertificateVerify signature.
+
+The certificate itself is only a container for the key — issuer, subject, SANs and
+validity window are all ignored, and there is no CA.
+
+Version negotiation is **ALPN** (`ultidesk/<PROTOCOL_VERSION>`), so a version mismatch is
+a refused handshake rather than an error exchanged over a channel that should not have
+opened. There is consequently no `Hello` on this transport: `Session::for_authenticated_peer`
+starts authenticated, and a `Hello` arriving anyway is refused rather than offering a
+second, weaker way in.
+
+Framing: a 4-byte big-endian length followed by the payload, on a bidirectional QUIC
+stream. The length is checked against `MAX_MESSAGE_BYTES` *before* the buffer is
+allocated. Newline framing was not carried over from the local IPC because it only works
+while the payload is newline-free.
+
+Messages are the same `IpcRequest`/`IpcResponse` enums as the local IPC, deliberately: the
+logic deciding what a peer may do has one implementation rather than one per transport.
+
+Pairing: both machines run `ultidesk-agent pair` (one listens, one dials), compare a
+six-digit code derived from both public keys and the TLS channel binding, and pin each
+other's key. `ultidesk-agent peers forget <key>` revokes.
+
+**Superseded:** `crates/agent/src/tcp.rs` (`serve-peer-dev`) is newline-delimited JSON over
+plaintext TCP behind a shared token. It is kept only to compare the two on a bench.
 
 ## Peer protocol (canonical schema, not yet implemented)
 
