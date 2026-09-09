@@ -35,6 +35,16 @@ control transport, clipboard, transfer) are **not** stubbed out — see
 - Rust stable (pinned via `rust-toolchain.toml`), tested with 1.93 on
   `x86_64-pc-windows-msvc` and 1.86 on `aarch64-pc-windows-msvc`.
 - Node 20+ and pnpm 10+.
+- **clang**, for the peer transport. `ring` — under `rustls`, under `quinn` — compiles C
+  and assembly, and on `aarch64-pc-windows-msvc` its build script overrides whatever
+  compiler cc-rs found and asks for `clang` by name, because MSVC cannot assemble its
+  AArch64 sources. Without it `cargo build` fails with
+  `error occurred in cc-rs: failed to find tool "clang"`.
+
+  ```bash
+  winget install --id LLVM.LLVM      # Windows
+  sudo pacman -S clang               # Arch
+  ```
 
 **On Windows ARM64, install through Corepack**, not the standalone `pnpm.exe`:
 
