@@ -10,6 +10,7 @@ pub mod layout;
 pub mod mapping;
 pub mod monitor;
 pub mod remote_pointer;
+pub mod saved;
 
 pub use audio::{AudioDevice, AudioRouting, DeviceKey, DeviceKind, Route, RouteError};
 pub use layout::{Adjacency, Layout, Rect, Side, DEFAULT_SNAP};
@@ -18,3 +19,4 @@ pub use mapping::{
 };
 pub use monitor::{Monitor, MonitorId, Rotation};
 pub use remote_pointer::{PointerUpdate, RemotePointer};
+pub use saved::{SavedLayout, SavedMonitor};

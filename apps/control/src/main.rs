@@ -20,12 +20,13 @@
 
 mod devices;
 mod monitors;
+mod settings;
 
 use devices::MachineAudio;
 use dioxus::prelude::*;
 use ultidesk_core::DeviceId;
 use ultidesk_topology::{
-    AudioRouting, DeviceKey, Layout, Monitor, MonitorId, Rotation, Route, DEFAULT_SNAP,
+    AudioRouting, DeviceKey, Layout, Monitor, MonitorId, Rotation, Route, SavedLayout, DEFAULT_SNAP,
 };
 
 fn main() {
@@ -47,13 +48,67 @@ fn main() {
 
 /// The machines this session knows about.
 ///
-/// Both ids are minted here because pairing does not exist yet. The local one is what
-/// the enumerated devices are attached to; the remote one exists so the routing panel
-/// can show the shape of a two-machine setup honestly, marked as not connected.
+/// The local id comes from the settings file so it is the same across launches *and*
+/// the same in both tabs — each tab used to mint its own, so the Displays tab and the
+/// Audio tab silently disagreed about which machine was "this machine". Nothing
+/// depended on it until saved routes did.
+///
+/// The remote id is still minted per launch: pairing does not exist, so there is no
+/// peer identity to be stable about yet. It exists so the panels can show the shape of
+/// a two-machine setup, marked as not connected.
 #[derive(Clone)]
 struct Machines {
     local: DeviceId,
     remote: DeviceId,
+}
+
+/// Everything loaded from disk once, and shared by both tabs through context.
+#[derive(Clone)]
+struct Session {
+    machines: Machines,
+    dir: Option<std::path::PathBuf>,
+    /// Anything the operator should know about the load, e.g. a settings file that
+    /// could not be read.
+    note: Option<String>,
+}
+
+impl Session {
+    fn load() -> (Self, settings::Settings) {
+        let dir = settings::config_dir();
+        let loaded = match &dir {
+            Some(d) => settings::load_from(d),
+            // No config directory at all (no HOME, no APPDATA). The app still works;
+            // it just cannot remember anything, and says so rather than pretending
+            // to save.
+            None => settings::Loaded {
+                settings: settings::Settings::fresh(),
+                note: Some(
+                    "no configuration directory available; changes will not be saved".into(),
+                ),
+            },
+        };
+        let session = Session {
+            machines: Machines {
+                local: loaded.settings.local_device_id,
+                remote: DeviceId::new(),
+            },
+            dir,
+            note: loaded.note,
+        };
+        (session, loaded.settings)
+    }
+}
+
+/// Write the current settings back, reporting failure rather than swallowing it.
+///
+/// Saving is best-effort by design: a full disk should not stop the operator editing
+/// their arrangement, but it must not look like it worked either.
+fn persist(session: &Session, settings: &settings::Settings) -> Option<String> {
+    let dir = session.dir.as_ref()?;
+    match settings::save_to(dir, settings) {
+        Ok(()) => None,
+        Err(e) => Some(format!("could not save settings: {e}")),
+    }
 }
 
 /// The peer's placeholder screen, until the settings IPC can carry a real one.
@@ -150,10 +205,21 @@ enum Tab {
 #[component]
 fn App() -> Element {
     let mut tab = use_signal(|| Tab::Displays);
+    // Loaded once and shared, so both tabs agree on this machine's identity and both
+    // write into the same file.
+    let (session, stored) = use_hook(|| {
+        let (session, stored) = Session::load();
+        (session, std::rc::Rc::new(std::cell::RefCell::new(stored)))
+    });
+    use_context_provider(|| session.clone());
+    use_context_provider(|| stored.clone());
 
     rsx! {
         style { {STYLE} }
         div { class: "app",
+            if let Some(note) = &session.note {
+                div { class: "warn", "{note}" }
+            }
             div { class: "tabs",
                 button {
                     class: if *tab.read() == Tab::Displays { "tab on" } else { "tab" },
@@ -176,10 +242,9 @@ fn App() -> Element {
 
 #[component]
 fn Displays() -> Element {
-    let machines = use_hook(|| Machines {
-        local: DeviceId::new(),
-        remote: DeviceId::new(),
-    });
+    let session = use_context::<Session>();
+    let stored = use_context::<std::rc::Rc<std::cell::RefCell<settings::Settings>>>();
+    let machines = session.machines.clone();
     let window = dioxus::desktop::use_window();
     // Real monitors, read once on mount. They do not change while the editor is open
     // often enough to justify watching for hotplug before the settings IPC exists.
@@ -199,9 +264,12 @@ fn Displays() -> Element {
         let mut peer = peer_placeholder(machines.remote);
         peer.logical_x = right;
         found.push(peer);
-        Layout::new(found)
+        // Saved positions are applied last, so anything the operator arranged wins over
+        // the platform's own idea of where the screens are.
+        stored.borrow().layout.apply(found)
     });
     let mut dragging = use_signal(|| None::<(usize, f64, f64)>);
+    let mut save_error = use_signal(|| None::<String>);
 
     // Measured from the DOM rather than assumed; see CANVAS_W_FALLBACK.
     let mut canvas_w = use_signal(|| CANVAS_W_FALLBACK);
@@ -253,7 +321,22 @@ fn Displays() -> Element {
                     layout.write().move_monitor(idx, lx, ly, DEFAULT_SNAP);
                 }
             },
-            onmouseup: move |_| dragging.set(None),
+            // Saved on release rather than on every motion event: a drag emits
+            // hundreds of those, and rewriting the file on each one would mean a
+            // constant stream of disk writes for one gesture.
+            onmouseup: {
+                let session = session.clone();
+                let stored = stored.clone();
+                move |_| {
+                if dragging.read().is_some() {
+                    dragging.set(None);
+                    stored.borrow_mut().layout = SavedLayout::from_layout(&layout.read());
+                    if let Some(err) = persist(&session, &stored.borrow()) {
+                        save_error.set(Some(err));
+                    }
+                }
+                }
+            },
             onmouseleave: move |_| dragging.set(None),
 
             for (i, m) in snapshot.monitors.iter().enumerate() {
@@ -298,6 +381,10 @@ fn Displays() -> Element {
             }
         }
 
+        if let Some(err) = save_error.read().as_ref() {
+            div { class: "warn", "{err}" }
+        }
+
         if !overlaps.is_empty() {
             div { class: "warn",
                 strong { "Screens overlap. " }
@@ -324,18 +411,21 @@ struct AudioState {
 }
 
 impl AudioState {
-    fn load() -> Self {
-        let local_id = DeviceId::new();
-        let remote_id = DeviceId::new();
+    fn load(machines_ids: &Machines, saved_routes: &[Route]) -> Self {
         let machines = vec![
-            devices::local(local_id, "This machine"),
-            devices::remote_placeholder(remote_id, "Peer"),
+            devices::local(machines_ids.local, "This machine"),
+            devices::remote_placeholder(machines_ids.remote, "Peer"),
         ];
         let all = machines.iter().flat_map(|m| m.devices.clone()).collect();
-        AudioState {
-            machines,
-            routing: AudioRouting::new(all),
+        let mut routing = AudioRouting::new(all);
+        // Re-checked on the way in rather than trusted. A device may be gone, or the
+        // inventory may have changed such that a once-valid pair is now a loop; adding
+        // through `add` is what refuses those, and skipping the check here would let a
+        // saved file reintroduce exactly the feedback the model exists to prevent.
+        for route in saved_routes {
+            let _ = routing.add(route.clone());
         }
+        AudioState { machines, routing }
     }
 
     fn label_for(&self, key: &DeviceKey) -> String {
@@ -357,7 +447,12 @@ impl AudioState {
 
 #[component]
 fn AudioPanel() -> Element {
-    let mut state = use_signal(AudioState::load);
+    let session = use_context::<Session>();
+    let stored = use_context::<std::rc::Rc<std::cell::RefCell<settings::Settings>>>();
+    let mut state = use_signal(|| {
+        let saved = stored.borrow().audio_routes.clone();
+        AudioState::load(&session.machines, &saved)
+    });
     let mut source = use_signal(|| None::<DeviceKey>);
     let mut sink = use_signal(|| None::<DeviceKey>);
     let mut message = use_signal(String::new);
@@ -480,7 +575,12 @@ fn AudioPanel() -> Element {
             button {
                 class: if can_add { "primary" } else { "primary disabled" },
                 disabled: !can_add,
-                onclick: move |_| {
+                onclick: {
+                    // Cloned per closure: both handlers need them, and `Rc`/`Session`
+                    // are not `Copy`, so the first `move` would take them.
+                    let session = session.clone();
+                    let stored = stored.clone();
+                    move |_| {
                     let route = {
                         let (a, b) = (source.read().clone(), sink.read().clone());
                         match (a, b) {
@@ -494,7 +594,12 @@ fn AudioPanel() -> Element {
                         let outcome = state.write().routing.add(route);
                         match outcome {
                             Ok(()) => {
-                                message.set("route added".into());
+                                stored.borrow_mut().audio_routes =
+                                    state.read().routing.routes().to_vec();
+                                match persist(&session, &stored.borrow()) {
+                                    Some(err) => message.set(err),
+                                    None => message.set("route added".into()),
+                                }
                                 source.set(None);
                                 sink.set(None);
                             }
@@ -505,6 +610,7 @@ fn AudioPanel() -> Element {
                                 message.set(text);
                             }
                         }
+                    }
                     }
                 },
                 "Add route"
@@ -531,11 +637,18 @@ fn AudioPanel() -> Element {
                                 class: "link",
                                 onclick: {
                                     let idx = *i;
+                                    let session = session.clone();
+                                    let stored = stored.clone();
                                     move |_| {
                                         let route = state.read().routing.routes().get(idx).cloned();
                                         if let Some(route) = route {
                                             state.write().routing.remove(&route);
-                                            message.set("route removed".into());
+                                            stored.borrow_mut().audio_routes =
+                                                state.read().routing.routes().to_vec();
+                                            match persist(&session, &stored.borrow()) {
+                                                Some(err) => message.set(err),
+                                                None => message.set("route removed".into()),
+                                            }
                                         }
                                     }
                                 },
