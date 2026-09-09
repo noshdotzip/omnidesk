@@ -29,6 +29,7 @@
 pub mod audio_devices;
 pub mod caps;
 pub mod ei_client;
+pub mod evdev_capture;
 pub mod input_capture;
 // Moved to `ultidesk-core` once the agent needed it too (it is pure arithmetic, not
 // platform code). Re-exported so the portal injector's path does not change.

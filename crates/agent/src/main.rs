@@ -56,6 +56,7 @@ fn main() -> Result<()> {
         "kvm-demo" => kvm_demo(),
         "kvm-mirror" => kvm_mirror(),
         "kvm-handoff" => kvm_handoff(),
+        "input-devices" => input_devices(),
         "uinput-test" => uinput_test(),
         "kvm-source" => kvm_source(),
         "audio-devices" => audio_devices(),
@@ -65,7 +66,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -721,6 +722,24 @@ fn to_wire(e: ultidesk_platform_linux::ei_client::CapturedInput) -> crate::forwa
 #[cfg(not(target_os = "linux"))]
 fn kvm_source() -> Result<()> {
     anyhow::bail!("kvm-source drives the XDG InputCapture portal and libei; it is Linux-only")
+}
+
+/// List the input devices this machine could capture, as JSON.
+///
+/// Read-only and raises no dialog. Its other job is to report the permission state
+/// plainly: reading `/dev/input/event*` needs the `input` group, and the error says so
+/// rather than leaving an empty list to be misread as "no devices".
+#[cfg(target_os = "linux")]
+fn input_devices() -> Result<()> {
+    let devices = ultidesk_platform_linux::evdev_capture::enumerate()?;
+    println!("{}", serde_json::to_string_pretty(&devices)?);
+    tracing::info!(count = devices.len(), "enumerated capturable input devices");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn input_devices() -> Result<()> {
+    anyhow::bail!("input-devices reads /dev/input and is Linux-only")
 }
 
 /// Drive the real pointer with virtual input devices, with no portal involved.
