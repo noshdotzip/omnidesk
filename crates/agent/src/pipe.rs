@@ -51,7 +51,7 @@ async fn handle_connection<I: Injector>(
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(server);
     let mut reader = BufReader::new(read_half);
-    let mut session = Session::new();
+    let mut session = Session::new(token);
     let mut line = String::new();
 
     let result = loop {
@@ -80,7 +80,7 @@ async fn handle_connection<I: Injector>(
             continue;
         }
         let response = match serde_json::from_str::<IpcRequest>(trimmed) {
-            Ok(req) => session.handle(req, token, injector),
+            Ok(req) => session.handle(req, injector),
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),

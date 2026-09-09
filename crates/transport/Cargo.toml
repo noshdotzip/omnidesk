@@ -1,0 +1,33 @@
+[package]
+name = "ultidesk-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ultidesk-core = { workspace = true }
+ultidesk-identity = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+# QUIC, and the TLS 1.3 stack under it. `ring` rather than `aws-lc-rs` because it is the
+# provider that builds on every target this project ships to — note it needs clang on
+# aarch64-pc-windows-msvc, which is a real prerequisite on the ARM64 machine.
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "log",
+] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+
+# Wraps the device's Ed25519 key in the X.509 envelope TLS insists on carrying. The
+# certificate is a container, not a trust statement — see `cert.rs`.
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+x509-parser = "0.16"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

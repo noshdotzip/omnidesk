@@ -12,6 +12,15 @@
 //!                              Linux only; read-only, raises no permission dialog.
 //!   ultidesk-agent identity    Print this machine's Ed25519 device identity, creating
 //!                              it on first run. Never prints the private key.
+//!   ultidesk-agent pair        Pair with another machine: compare a six-digit code on
+//!                              both screens, then pin its key.
+//!                              pair            wait for a peer to dial in
+//!                              pair host:port  dial a peer that is waiting
+//!   ultidesk-agent peers       List trusted devices. `peers forget <key>` revokes one.
+//!   ultidesk-agent serve-peer  Serve paired peers over the authenticated QUIC channel
+//!                              (ADR-0002). No token: a peer is admitted by its key.
+//!   ultidesk-agent peer-ping   Round-trip a Ping against a paired peer and report the
+//!                              latency of the real path. Injects nothing.
 //!   ultidesk-agent uinput-test Move the pointer through a square using virtual
 //!                              input devices. Linux only. Raises NO permission
 //!                              dialog and DOES move the real cursor.
@@ -36,11 +45,12 @@ mod ipc;
 mod pipe;
 #[cfg(target_os = "linux")]
 mod portal_injector;
+mod quic;
 mod tcp;
 #[cfg(target_os = "linux")]
 mod uinput_injector;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ipc::Injector;
 
 fn main() -> Result<()> {
@@ -56,6 +66,10 @@ fn main() -> Result<()> {
         "capture-test" => capture_test(),
         "cast-test" => cast_test(),
         "serve-peer-dev" => serve_peer_dev(),
+        "serve-peer" => serve_peer(),
+        "peer-ping" => peer_ping(),
+        "pair" => pair(),
+        "peers" => peers(),
         "kvm-demo" => kvm_demo(),
         "kvm-mirror" => kvm_mirror(),
         "kvm-handoff" => kvm_handoff(),
@@ -69,7 +83,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|identity|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -404,29 +418,12 @@ fn identity() -> Result<()> {
     Ok(())
 }
 
-/// Serve the **dev** peer transport so another machine can drive this one's input.
+/// Choose the input backend this machine will let peers drive.
 ///
-/// On Linux this opens a RemoteDesktop portal session first, so the (single)
-/// permission prompt happens at startup rather than on the first injected event.
-/// Pass a previous grant in `ULTIDESK_RESTORE_TOKEN` to skip the prompt entirely.
-///
-/// Plaintext and token-gated only — see the warning in `tcp.rs`. Trusted LAN only.
-fn serve_peer_dev() -> Result<()> {
-    let bind = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "0.0.0.0:45872".to_string());
-    let token = std::env::var("ULTIDESK_PEER_TOKEN")
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
-
-    eprintln!("WARNING: dev peer transport is PLAINTEXT TCP, gated only by a token.");
-    eprintln!("WARNING: it is not the ADR-0002 secure channel. Trusted LAN only.");
-    println!("bind={bind}");
-    println!("token={token}");
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
+/// Shared by both peer transports rather than decided per transport: which injector is
+/// in use decides whether the agent can run unattended, and choosing it in two places is
+/// two chances to choose differently.
+fn choose_injector() -> Result<std::sync::Arc<dyn Injector + Send + Sync>> {
     #[cfg(target_os = "linux")]
     {
         // uinput first: it needs no permission dialog, so an agent started at login can
@@ -442,7 +439,7 @@ fn serve_peer_dev() -> Result<()> {
                 Ok(injector) => {
                     println!("injector=uinput (no permission dialog)");
                     tracing::info!("uinput devices ready; peers may now inject input");
-                    return rt.block_on(tcp::serve(bind, token, std::sync::Arc::new(injector)));
+                    return Ok(std::sync::Arc::new(injector));
                 }
                 Err(e) => {
                     // Reported rather than silently downgraded: falling back to a path
@@ -459,16 +456,226 @@ fn serve_peer_dev() -> Result<()> {
         }
         println!("injector=portal");
         tracing::info!("portal session ready; peers may now inject input");
-        rt.block_on(tcp::serve(bind, token, std::sync::Arc::new(injector)))
+        Ok(std::sync::Arc::new(injector))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        rt.block_on(tcp::serve(
-            bind,
-            token,
-            std::sync::Arc::new(ipc::RealInjector),
-        ))
+        Ok(std::sync::Arc::new(ipc::RealInjector))
     }
+}
+
+/// Serve the **dev** peer transport so another machine can drive this one's input.
+///
+/// Plaintext and token-gated only — see the warning in `tcp.rs`. Superseded by
+/// `serve-peer`, and kept only so the two can be compared on a bench.
+fn serve_peer_dev() -> Result<()> {
+    let bind = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "0.0.0.0:45872".to_string());
+    let token = std::env::var("ULTIDESK_PEER_TOKEN")
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().simple().to_string());
+
+    eprintln!("WARNING: dev peer transport is PLAINTEXT TCP, gated only by a token.");
+    eprintln!("WARNING: it is not the ADR-0002 secure channel. Use `serve-peer` instead.");
+    println!("bind={bind}");
+    println!("token={token}");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let injector = choose_injector()?;
+    rt.block_on(tcp::serve(bind, token, injector))
+}
+
+/// Serve paired peers over the authenticated QUIC channel (ADR-0002).
+///
+/// Unlike `serve-peer-dev` there is no token to print and none to copy: a peer is
+/// admitted because it holds the private key for an identity this machine has pinned,
+/// and it proves that during the handshake.
+fn serve_peer() -> Result<()> {
+    let bind: std::net::SocketAddr = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "0.0.0.0:45872".to_string())
+        .parse()
+        .context("the bind address must be host:port, e.g. 0.0.0.0:45872")?;
+
+    let (dir, identity) = local_identity()?;
+    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
+    if let Some(note) = loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+
+    println!("this machine: {}", identity.fingerprint());
+    for peer in loaded.store.peers() {
+        println!("paired with: {} ({})", peer.name, peer.key.fingerprint());
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let injector = choose_injector()?;
+    rt.block_on(quic::serve(&identity, bind, &loaded.store, injector))
+}
+
+/// Round-trip a Ping against a paired peer, and report the latency of the real path.
+fn peer_ping() -> Result<()> {
+    let addr: std::net::SocketAddr = std::env::args()
+        .nth(2)
+        .ok_or_else(|| anyhow::anyhow!("usage: ultidesk-agent peer-ping <host:port> [count]"))?
+        .parse()
+        .context("the peer address must be host:port")?;
+    let count: u32 = std::env::args()
+        .nth(3)
+        .map(|n| n.parse())
+        .transpose()
+        .context("count must be a number")?
+        .unwrap_or(5);
+
+    let (dir, identity) = local_identity()?;
+    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
+    if let Some(note) = &loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(quic::peer_ping(&identity, &loaded.store, addr, count))
+}
+
+/// Pair with another machine: establish a channel, compare a code, pin the key.
+///
+/// `pair` with no address listens; `pair <host:port>` dials. One machine does each, and
+/// both operators must see the same six digits before answering yes.
+fn pair() -> Result<()> {
+    let target = std::env::args().nth(2);
+    let (dir, identity) = local_identity()?;
+    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
+    if let Some(note) = &loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+    let mut store = loaded.store;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    println!("this machine: {}", identity.fingerprint());
+    let paired = match &target {
+        Some(addr) => {
+            let addr: std::net::SocketAddr = addr
+                .parse()
+                .context("the peer address must be host:port, e.g. 192.168.137.9:45872")?;
+            rt.block_on(quic::pair_connect(&identity, addr))?
+        }
+        None => {
+            let bind: std::net::SocketAddr = "0.0.0.0:45872".parse()?;
+            rt.block_on(quic::pair_listen(&identity, bind))?
+        }
+    };
+
+    println!();
+    println!("  peer fingerprint: {}", paired.key.fingerprint());
+    println!("  pairing code:     {}", paired.code);
+    println!();
+    println!("The other machine must be showing the SAME code. If it is not, answer no:");
+    println!("two different codes is what a machine in the middle looks like.");
+
+    if !confirm("Does the code match? [y/N] ")? {
+        // Nothing is written. Refusing has to leave the machine exactly as it was.
+        println!("not paired");
+        return Ok(());
+    }
+
+    let name = prompt("Name for this peer: ")?;
+    let outcome = store
+        .pin(paired.key, &name, ultidesk_identity::peers::now_unix())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    store.save(&dir)?;
+
+    match outcome {
+        ultidesk_identity::PinOutcome::Added => println!("paired with {name}"),
+        ultidesk_identity::PinOutcome::Unchanged => println!("{name} was already paired"),
+        ultidesk_identity::PinOutcome::Renamed { previous } => {
+            println!("already paired; renamed from {previous} to {name}")
+        }
+    }
+    println!("now run `ultidesk-agent serve-peer` on both machines");
+    Ok(())
+}
+
+/// List the devices this machine trusts, or revoke one with `peers forget <key>`.
+fn peers() -> Result<()> {
+    let (dir, identity) = local_identity()?;
+    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
+    if let Some(note) = &loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+    let mut store = loaded.store;
+
+    if let (Some("forget"), Some(key_text)) =
+        (std::env::args().nth(2).as_deref(), std::env::args().nth(3))
+    {
+        let key = ultidesk_identity::PeerKey::parse(&key_text).ok_or_else(|| {
+            anyhow::anyhow!("not a public key; pass the 64-character value from `identity`")
+        })?;
+        // Reported honestly rather than always claiming success: "forgotten" and "was
+        // never there" are different answers to the same command.
+        if store.forget(&key) {
+            store.save(&dir)?;
+            println!("forgot {}", key.fingerprint());
+        } else {
+            println!("{} was not paired", key.fingerprint());
+        }
+        return Ok(());
+    }
+
+    println!(
+        "this machine: {} ({})",
+        identity.fingerprint(),
+        identity.public()
+    );
+    if store.peers().is_empty() {
+        println!("no peers are paired; run `ultidesk-agent pair`");
+    }
+    for peer in store.peers() {
+        println!("{}  {}  {}", peer.key.fingerprint(), peer.name, peer.key);
+    }
+    Ok(())
+}
+
+/// This machine's configuration directory and identity, or a message saying why not.
+fn local_identity() -> Result<(std::path::PathBuf, ultidesk_identity::Identity)> {
+    let dir = ultidesk_core::paths::config_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no configuration directory (no APPDATA on Windows, no HOME or XDG_CONFIG_HOME \
+             on Linux); set ULTIDESK_CONFIG_DIR to choose one"
+        )
+    })?;
+    let loaded = ultidesk_identity::load_or_create(&dir)?;
+    if let Some(note) = &loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+    Ok((dir, loaded.identity))
+}
+
+/// Read a line, treating anything but an explicit yes as no.
+///
+/// Default-no on purpose: an operator who presses enter without reading has not
+/// confirmed that two codes match, and pairing is the one moment where the security of
+/// everything afterwards depends on them having actually looked.
+fn confirm(question: &str) -> Result<bool> {
+    let answer = prompt(question)?;
+    Ok(matches!(answer.to_lowercase().as_str(), "y" | "yes"))
+}
+
+fn prompt(question: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{question}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
 }
 
 /// Drive a remote peer's pointer through a square, to prove the whole path works.

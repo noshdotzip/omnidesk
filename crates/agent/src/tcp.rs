@@ -24,10 +24,11 @@ use tokio::net::{TcpListener, TcpStream};
 use ultidesk_core::protocol::MAX_MESSAGE_BYTES;
 
 /// Listen for peers and serve each one until it disconnects.
-pub async fn serve<I>(bind: String, token: String, injector: Arc<I>) -> anyhow::Result<()>
-where
-    I: Injector + Send + Sync + 'static,
-{
+pub async fn serve(
+    bind: String,
+    token: String,
+    injector: Arc<dyn Injector + Send + Sync>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&bind)
         .await
         .with_context(|| format!("failed to bind {bind}"))?;
@@ -52,14 +53,14 @@ where
     }
 }
 
-async fn handle_connection<I: Injector>(
+async fn handle_connection(
     stream: TcpStream,
     token: &str,
-    injector: &I,
+    injector: &(dyn Injector + Send + Sync),
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
-    let mut session = Session::new();
+    let mut session = Session::new(token);
     let mut line = String::new();
 
     let result = loop {
@@ -87,7 +88,7 @@ async fn handle_connection<I: Injector>(
             continue;
         }
         let response = match serde_json::from_str::<IpcRequest>(trimmed) {
-            Ok(req) => session.handle(req, token, injector),
+            Ok(req) => session.handle(req, injector),
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),

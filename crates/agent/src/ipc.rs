@@ -170,16 +170,47 @@ impl Injector for RealInjector {
 /// button currently held *by this session*, so a dropped connection can release them
 /// and never leave the source machine with a stuck modifier (brief §10, acceptance
 /// criteria).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Session {
+    /// The secret this session will accept in `Hello`, or `None` when the transport
+    /// already authenticated the peer.
+    ///
+    /// Held here rather than passed to every [`Session::handle`] call so that an
+    /// already-authenticated session has no token to compare against at all. Passing
+    /// one in per call meant the transport that does not use tokens had to invent a
+    /// value to pass — and an empty string would have matched an empty `Hello`.
+    expected_token: Option<String>,
     authenticated: bool,
     held_buttons: HashSet<MouseButton>,
     held_scancodes: HashSet<u16>,
 }
 
 impl Session {
-    pub fn new() -> Self {
-        Self::default()
+    /// A session gated by a shared secret: the local named pipe, and the dev TCP peer
+    /// transport.
+    pub fn new(expected_token: &str) -> Self {
+        Session {
+            expected_token: Some(expected_token.to_string()),
+            authenticated: false,
+            held_buttons: HashSet::new(),
+            held_scancodes: HashSet::new(),
+        }
+    }
+
+    /// A session whose peer was authenticated by the transport itself.
+    ///
+    /// The QUIC channel (`ultidesk-transport`) proves the peer holds the private key for
+    /// a pinned identity before a single byte of this protocol is exchanged, and
+    /// negotiates the protocol version through ALPN. There is nothing left for a `Hello`
+    /// to establish, so one is refused as a duplicate rather than being a second, weaker
+    /// way in.
+    pub fn for_authenticated_peer() -> Self {
+        Session {
+            expected_token: None,
+            authenticated: true,
+            held_buttons: HashSet::new(),
+            held_scancodes: HashSet::new(),
+        }
     }
 
     /// Introspection helpers used by tests (and by future diagnostics). Kept test-only
@@ -194,21 +225,21 @@ impl Session {
         self.held_buttons.len() + self.held_scancodes.len()
     }
 
-    /// Handle one request. `expected_token` is the per-launch secret; any command other
-    /// than `Hello` before successful authentication is rejected.
-    pub fn handle<I: Injector>(
-        &mut self,
-        req: IpcRequest,
-        expected_token: &str,
-        injector: &I,
-    ) -> IpcResponse {
+    /// Handle one request. Any command other than `Hello` before successful
+    /// authentication is rejected.
+    pub fn handle<I: Injector + ?Sized>(&mut self, req: IpcRequest, injector: &I) -> IpcResponse {
         if !self.authenticated {
             match req {
                 IpcRequest::Hello {
                     token,
                     protocol_version,
                 } => {
-                    if !constant_time_eq(token.as_bytes(), expected_token.as_bytes()) {
+                    // No token means no way in: a session with nothing to compare
+                    // against refuses rather than accepting anything.
+                    let Some(expected) = self.expected_token.as_deref() else {
+                        return err("unauthorized", "this transport does not accept tokens");
+                    };
+                    if !constant_time_eq(token.as_bytes(), expected.as_bytes()) {
                         return err("unauthorized", "invalid auth token");
                     }
                     if protocol_version != PROTOCOL_VERSION {
@@ -287,7 +318,7 @@ impl Session {
     /// Release everything this session holds. Called on `ReleaseAllInput` and, by the
     /// transport, whenever a connection drops. Best-effort: injection errors during
     /// release are ignored so one stuck key cannot block releasing the rest.
-    pub fn release_all<I: Injector>(&mut self, injector: &I) -> usize {
+    pub fn release_all<I: Injector + ?Sized>(&mut self, injector: &I) -> usize {
         let mut count = 0;
         for b in self.held_buttons.drain().collect::<Vec<_>>() {
             let _ = injector.mouse_button(b, false);
@@ -372,14 +403,13 @@ mod tests {
     const TOKEN: &str = "s3cret-token";
 
     fn authed() -> (Session, MockInjector) {
-        let mut s = Session::new();
+        let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
         let r = s.handle(
             IpcRequest::Hello {
                 token: TOKEN.into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            TOKEN,
             &inj,
         );
         assert!(matches!(r, IpcResponse::HelloOk { .. }));
@@ -388,23 +418,51 @@ mod tests {
 
     #[test]
     fn commands_before_hello_are_rejected() {
-        let mut s = Session::new();
+        let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
-        let r = s.handle(IpcRequest::Ping, TOKEN, &inj);
+        let r = s.handle(IpcRequest::Ping, &inj);
         assert!(matches!(r, IpcResponse::Error { .. }));
         assert!(!s.is_authenticated());
     }
 
     #[test]
+    fn a_transport_authenticated_peer_needs_no_hello() {
+        // The QUIC path: the handshake already proved which device this is, so the
+        // first message may be a command.
+        let mut s = Session::for_authenticated_peer();
+        let inj = MockInjector::default();
+        assert!(s.is_authenticated());
+        assert!(matches!(
+            s.handle(IpcRequest::Ping, &inj),
+            IpcResponse::Pong
+        ));
+    }
+
+    #[test]
+    fn a_transport_authenticated_peer_cannot_offer_a_token() {
+        // There is nothing for a Hello to establish, and accepting one would be a
+        // second, weaker way in beside the handshake.
+        let mut s = Session::for_authenticated_peer();
+        let inj = MockInjector::default();
+        let r = s.handle(
+            IpcRequest::Hello {
+                token: String::new(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            &inj,
+        );
+        assert!(matches!(r, IpcResponse::Error { .. }), "{r:?}");
+    }
+
+    #[test]
     fn wrong_token_rejected() {
-        let mut s = Session::new();
+        let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
         let r = s.handle(
             IpcRequest::Hello {
                 token: "nope".into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            TOKEN,
             &inj,
         );
         assert!(matches!(r, IpcResponse::Error { .. }));
@@ -413,14 +471,13 @@ mod tests {
 
     #[test]
     fn protocol_mismatch_rejected() {
-        let mut s = Session::new();
+        let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
         let r = s.handle(
             IpcRequest::Hello {
                 token: TOKEN.into(),
                 protocol_version: PROTOCOL_VERSION + 100,
             },
-            TOKEN,
             &inj,
         );
         assert!(matches!(r, IpcResponse::Error { code, .. } if code == "protocol_mismatch"));
@@ -434,7 +491,6 @@ mod tests {
                 button: MouseButtonDto::Left,
                 down: true,
             },
-            TOKEN,
             &inj,
         );
         s.handle(
@@ -442,12 +498,11 @@ mod tests {
                 scancode: 0x1D,
                 down: true,
             },
-            TOKEN,
             &inj,
         ); // Ctrl
         assert_eq!(s.held_count(), 2);
 
-        let r = s.handle(IpcRequest::ReleaseAllInput, TOKEN, &inj);
+        let r = s.handle(IpcRequest::ReleaseAllInput, &inj);
         assert!(matches!(r, IpcResponse::Released { count: 2 }));
         assert_eq!(s.held_count(), 0);
         // The mock recorded the key-up / button-up during release.
@@ -464,7 +519,6 @@ mod tests {
                 scancode: 0x1D,
                 down: true,
             },
-            TOKEN,
             &inj,
         );
         assert_eq!(s.held_count(), 1);
@@ -473,7 +527,6 @@ mod tests {
                 scancode: 0x1D,
                 down: false,
             },
-            TOKEN,
             &inj,
         );
         assert_eq!(s.held_count(), 0);
@@ -481,7 +534,7 @@ mod tests {
 
     #[test]
     fn blocked_injection_surfaces_error_and_is_not_marked_held() {
-        let mut s = Session::new();
+        let mut s = Session::new(TOKEN);
         let inj = MockInjector {
             fail_blocked: true,
             ..Default::default()
@@ -492,7 +545,6 @@ mod tests {
                 token: TOKEN.into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            TOKEN,
             &inj,
         );
         let r = s.handle(
@@ -500,7 +552,6 @@ mod tests {
                 button: MouseButtonDto::Left,
                 down: true,
             },
-            TOKEN,
             &inj,
         );
         assert!(matches!(r, IpcResponse::Error { code, .. } if code == "input_blocked"));
