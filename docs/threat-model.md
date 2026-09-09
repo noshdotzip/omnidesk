@@ -17,12 +17,12 @@ defenses, and is explicit about what is implemented today vs. planned.
 | Threat | Defense | Status |
 |---|---|---|
 | Passive LAN eavesdropper | TLS 1.3 control plane; DTLS-SRTP media | planned (M1) |
-| Active MITM during pairing | SAS verification code from the handshake transcript; user confirms both sides match | planned (M1) |
-| Spoofed device advertisement | Discovery is only a hint; connection requires the pinned identity | planned (M1) |
+| Active MITM during pairing | Six-digit code over both public keys (sorted) plus the TLS channel binding; user confirms both sides match | derivation **implemented + tested** (`ultidesk-identity::sas`); never yet computed against a real channel binding |
+| Spoofed device advertisement | Discovery is only a hint; connection requires the pinned identity | pinning store **implemented + tested**; discovery and the connection that would consult it are not built |
 | Replayed control command | Session nonces, sequence numbers, monotonic timestamps | partial (seq/ts in schema) |
-| Stolen paired identity | Private key in OS secret store (DPAPI/Secret Service); revocation | planned (M1) |
+| Stolen paired identity | Private key in OS secret store (DPAPI/Secret Service); revocation | **not implemented**: the key is a `0600` file on Unix and an unrestricted file on Windows. Revocation exists as `PeerStore::forget` |
 | Malicious but paired peer | **Source-side** permission enforcement; a receiver claiming a permission is not enough | design enforced (see permissions.md) |
-| Revoked peer reconnecting | Pinned-identity check refuses revoked keys | planned (M1) |
+| Revoked peer reconnecting | Pinned-identity check refuses revoked keys | the check exists (`PeerStore::trusts`); nothing calls it yet because no peer connection exists |
 | Unauthorized input injection | Input only accepted on an authenticated session with a valid lease; `can_forward_input` gated to `RemoteActive` | logic implemented + tested |
 | Input loops / replay (A→B→A, rings) | Layered guard: injection marker, origin id, hop TTL, event de-dup | **implemented + tested** (`core::input_guard`) |
 | Stuck modifiers after failure | Session tracks held keys/buttons; released on `ReleaseAllInput` **and** on any IPC disconnect; hardcoded emergency release `Ctrl+Alt+Shift+Esc` | release-on-disconnect **implemented + tested**; emergency hotkey planned (M2) |
@@ -49,8 +49,14 @@ the local physical user can always preempt and terminate remote access.
 
 ## Known gaps in this slice (do not treat as secure yet)
 
-- No pairing/identity/transport encryption is implemented — the peer network path is not
-  built. The current projection path is a **dev loopback** inside one process only.
+- **No transport encryption.** The only cross-machine transport is plaintext TCP behind a
+  shared token (`crates/agent/src/tcp.rs`), and it carries keystrokes. Device identity
+  now exists ([ADR-0012](adrs/0012-device-identity.md)) but nothing authenticates a
+  connection with it yet, so identity buys nothing on the wire so far.
+- **The device private key is not in OS secret storage.** It is a file: mode `0600` on
+  Unix, and on Windows a normal file in `%APPDATA%` with no ACL restriction — the same
+  outstanding hardening the named pipe has. Any process running as this user can read it.
+- The current projection path is a **dev loopback** inside one process only.
 - Named-pipe ACL restriction to the current user is not yet applied (token only).
 - Emergency-release hotkey and on-screen capture indicators are not yet implemented.
 

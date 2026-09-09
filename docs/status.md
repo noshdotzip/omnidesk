@@ -161,11 +161,15 @@ see [compatibility.md](compatibility.md) for the portal probe of what the platfo
 
 ## Deliberately NOT built yet (no stubs, per engineering rules)
 
-Device identity/pairing/discovery, the authenticated peer control channel (QUIC/TLS),
-per-peer permission store + Work Device runtime enforcement, monitor topology editor UI,
-KVM cursor edge-crossing, clipboard subsystem, file transfer, window handoff, Linux
-backends, audio, game-provider integration, packaging/signing, emergency-release hotkey,
-on-screen capture indicators, named-pipe ACL hardening.
+Discovery, the authenticated peer control channel (QUIC/TLS), per-peer permission store
++ Work Device runtime enforcement, monitor topology editor UI, KVM cursor edge-crossing,
+clipboard subsystem, file transfer, window handoff, Linux backends, audio, game-provider
+integration, packaging/signing, emergency-release hotkey, on-screen capture indicators,
+named-pipe ACL hardening, OS secret storage for the device key.
+
+Device **identity** and the pinning/pairing *logic* are now built - see below. What is
+missing is everything that needs a network: nothing exchanges keys yet, so no peer has
+ever been pinned by anything but a unit test.
 
 ## Known limitations / tracked debt
 
@@ -426,6 +430,35 @@ socket before the control app can ask the agent anything.
   (see above), but the stream itself is still uncompressed PCM over plaintext TCP and
   Linux playback still shells out to `pw-play`. Opus/RTP over the ADR-0002 transport
   is the target; PipeWire `rtp-sink`/`rtp-source` are present on the Arch box.
+
+## Verified: device identity (2026-09-09)
+
+Executed on `aarch64-pc-windows-msvc`. A device is now an Ed25519 key pair and its
+`DeviceId` is derived from the public key ([ADR-0012](adrs/0012-device-identity.md)),
+replacing the random uuid that made a "peer" unnameable.
+
+- `cargo test --workspace` -> **313 tests pass** (258 before). Clippy `-D warnings` and
+  `cargo fmt --check` clean.
+- `ultidesk-agent identity` run against a scratch config directory and then against the
+  real one: created on the first run, `created:false` and byte-identical output on the
+  second, so the id is stable across processes. The private key is never printed or
+  logged.
+- This machine: fingerprint `E7A0-CB0C-D78D-6E89-7BED`, key file at
+  `%APPDATA%\\Ultidesk\\identity.json`.
+- The control app shows the fingerprint in its header, because pairing works by an
+  operator comparing that string against the other machine's.
+
+New crate `ultidesk-identity`: `Identity`/`PeerKey`, the derived id, the pinned
+`PeerStore`, the six-digit pairing code, and the file handling. 39 of the new tests are
+its own. Pure Rust - deliberately no C toolchain, unlike the QUIC stack.
+
+**Not verified**: nothing has been paired, because nothing connects. The pairing code
+has never been computed against a real TLS channel binding - every test passes one in by
+hand. The Arch machine has not run `identity` yet, so no second identity exists.
+
+**Still a placeholder on Windows**: the key file is created `0600` on Unix and is merely
+a normal file on Windows, which has no mode bits. Moving it into DPAPI / the Secret
+Service is Milestone-1 work and has not been done.
 
 ## Exact next step
 

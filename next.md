@@ -43,12 +43,22 @@ TCP, and Linux playback shells out to `pw-play`.
 
 Everything cross-machine currently runs over **plaintext TCP gated by a shared token**,
 including keystrokes. That is fine for a bench on a trusted LAN and is not shippable in
-any other sense. It also blocks the rest of this list: pairing, identity, and the
-settings IPC all want a real channel to sit on, and building them against the dev
-transport means building them twice.
+any other sense. It also blocks the rest of this list: pairing and the settings IPC both
+want a real channel to sit on, and building them against the dev transport means
+building them twice.
 
 This is first not because it is the most interesting but because everything else
 inherits from it.
+
+**Identity for it now exists** (`ultidesk-identity`, 2026-09-09): the keys to pin, the
+store to pin them in, and the pairing code are built and tested. What is missing is the
+channel that presents them.
+
+**A toolchain note found while starting it.** `quinn`/`rustls` reach `ring`, and ring's
+build script *hard-requires clang* on `aarch64-pc-windows-msvc` — it overrides whatever
+compiler cc-rs found and asks for `clang` by name, because MSVC cannot assemble its
+AArch64 sources. So the QUIC stack does not build on the Windows ARM64 machine until
+LLVM is installed there. The Arch machine already has clang.
 
 ### 2. Local IPC on Linux, then the settings IPC
 
@@ -159,10 +169,12 @@ as a deliberate later decision rather than something to attempt in passing.
    today. Blocks shipping anything, and blocks building pairing and settings IPC once
    rather than twice.
 
-2. **No device identity or pairing.** `DeviceId` is a random uuid persisted in the
-   settings file — deliberately a placeholder. Until Ed25519 identity exists, a "peer"
-   cannot be named, saved, or trusted, which is why the control app's peer panels are
-   placeholders.
+2. ~~**No device identity or pairing.**~~ **Resolved 2026-09-09** for the offline half:
+   `DeviceId` is now derived from an Ed25519 public key, and pinning plus the six-digit
+   pairing code are built and tested (`ultidesk-identity`,
+   [ADR-0012](docs/adrs/0012-device-identity.md)). What remains needs blocker 1: no key
+   has ever been exchanged, so no peer has been pinned outside a unit test. The private
+   key is also still a plain file rather than DPAPI / Secret Service.
 
 3. **No local IPC on Linux.** `pipe.rs` is Windows-only. The control app cannot ask the
    agent anything on Linux, so every peer-side panel stays a placeholder.
