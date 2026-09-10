@@ -563,13 +563,64 @@ password, so `sudo usermod -aG input $USER` could not be run. `input-devices` st
 reports the permission error, and evdev capture — the last piece the KVM daemon needs —
 stays unavailable.
 
+## Verified: local IPC on Linux, and evdev unblocked (2026-09-10)
+
+`sudo usermod -aG input $USER` was run on the Arch machine, which clears the last
+outstanding permission blocker: `ultidesk-agent input-devices` now enumerates the real
+hardware — `SYNA32A4:00 06CB:CE17 Mouse` at `/dev/input/event7` and
+`AT Translated Set 2 keyboard` at `/dev/input/event3`. The capture path has still never
+been *run*; grabbing a keyboard on a machine nobody is sitting at is not something to do
+in passing.
+
+`crates/agent/src/unix_socket.rs` gives the agent local IPC on Linux, which it had none
+of. Verified live on Arch:
+
+- Socket at `/run/user/1000/ultidesk/agent.sock`, mode `srw-------`, in a directory the
+  session provides as `drwx------`. The handshake file beside it is `-rw-------`, because
+  it carries the token.
+- Authentication enforced through the same `Session` the named pipe uses: `Ping` before
+  `Hello` refused, a wrong token refused, the real token accepted, then `Ping` -> `Pong`.
+- `EnumerateWindows` returns `[]` and `InjectMouseMove` returns
+  `input_unsupported` — honest answers rather than silence, since neither capability
+  exists in this build on Linux.
+- A second agent refuses to start: *"another Ultidesk agent is already listening ...;
+  stop it first"*.
+- `SIGTERM` removes the socket file.
+
+**Test counts diverge on purpose now**: **341** on Windows ARM64 and **347** on Arch. The
+difference is the six Unix-socket tests, which cannot compile on Windows. Clippy
+`-D warnings` and `cargo fmt --check` clean on both.
+
+### Two bugs the unit tests could not have caught
+
+Recorded because both are about the *shape* of the tests rather than the code:
+
+1. **`tokio::net::UnixListener::bind` needs a running runtime** and panics with "there is
+   no reactor running" otherwise. `serve` created the listener before building the
+   runtime, and every test is a `#[tokio::test]` — so a runtime always existed exactly
+   where the precondition was being exercised. The binary panicked on its first real
+   launch. `bind` is now `async`, which never awaits but makes calling it outside a
+   runtime a compile error.
+2. **`Drop` never ran.** The socket file survived every `pkill`, because a server whose
+   body is `loop { accept }` only returns if `accept` fails, and `SIGTERM` kills the
+   process mid-loop. Nothing broke — the next launch detected the file as stale and
+   replaced it, which is the path working as designed — but a leftover socket makes a
+   directory listing claim an agent is running. `serve` now selects on `SIGTERM`/`SIGINT`.
+
+**What this does not do yet**: the request set is unchanged, so the control app still has
+nothing new to ask for. Monitors, audio devices and topology are the settings IPC, and
+that is the next piece.
+
 ## Exact next step
 
-Milestone 1 continues. Identity, pinning, pairing and the authenticated channel are built
-and now verified between the two machines; what is left of the milestone is **discovery**
-(mDNS plus the manual IP entry that already works), **OS secret storage** for the device
-key, and **per-peer permissions** — pairing is currently all-or-nothing.
+The settings IPC: extend the request set so the control app can ask an agent for its
+monitors, its audio devices and its current topology, and apply a changed one. Both
+transports already carry it — the named pipe locally, and the QUIC channel for a peer —
+so this is the request set and the handlers, not another transport.
 
-The one thing still waiting on a person: `sudo usermod -aG input $USER` on the Arch
-machine, then a re-login. That unblocks evdev capture, which is the last missing piece of
-the KVM daemon (next.md item 3).
+One decision has to be made first and is written down in next.md rather than discovered
+later: **which coordinate space a peer's monitor geometry is expressed in**. Windows
+reports physical pixels and Wayland reports logical ones. On one machine that is
+coherent; across two with different scale factors it is not, and getting it wrong puts
+edge crossings in the wrong place on mixed-DPI desks — which is exactly where nobody
+tests.

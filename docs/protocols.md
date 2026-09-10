@@ -14,10 +14,27 @@ covers the delta. The agent IPC also checks it during `Hello` and returns
 
 ## Local IPC (implemented)
 
-Transport: Windows named pipe, newline-delimited JSON, one response per request in order.
-Auth: the agent generates a random pipe name + per-launch token, writes them to a
-per-user handshake file, and prints the file path on stdout. The desktop app reads it,
+Transport: a **Windows named pipe** or a **Unix socket**, newline-delimited JSON, one
+response per request in order. The agent writes its address and a per-launch token to a
+handshake file (`agent-endpoint.json`) in the session's runtime directory; the client
+reads that file and connects. The address is one field, `endpoint_path`, because a client
+opens both kinds the same way.
+
+On Linux the socket lives in `$XDG_RUNTIME_DIR/ultidesk/`, which the session provides
+mode `0700`. That directory permission is enforced by the kernel on every `connect()`,
+which makes it a stronger control than the named pipe has — the pipe is token-gated only,
+and ACL restriction is still tracked in [threat-model.md](threat-model.md). The token is
+required on both.
+
+A socket file left behind by a crashed agent is detected by probing it: a successful
+connect means a live agent and the new one refuses to start rather than stealing the
+path; `ECONNREFUSED` means it is stale and safe to replace.
+Auth: the agent generates a per-launch token, writes it with the address to the
+handshake file, and prints that file's path on stdout. The desktop app reads it,
 connects, and must send `Hello { token }` before any other command (enforced + tested).
+The pipe name carries a random suffix because the pipe namespace is machine-global and a
+fixed name can be squatted; the Unix socket does not need one, because the directory is
+already per-user — there the path needs to be *findable*, not unguessable.
 
 Request/response shapes are the serde-tagged enums in `crates/agent/src/ipc.rs`, mirrored
 by the discriminated unions in `apps/desktop/src/shared/protocol.ts`:

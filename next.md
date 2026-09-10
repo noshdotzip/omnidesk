@@ -63,16 +63,26 @@ the KVM daemon streams motion, not before.
 The plaintext TCP transport is still present as `serve-peer-dev`, kept for bench
 comparison. It should be deleted once item 3 runs on the real channel.
 
-### 2. Local IPC on Linux, then the settings IPC
+### 2. ~~Local IPC on Linux~~ — **done 2026-09-10** — then the settings IPC
 
-The control app can read the *local* machine's monitors and audio devices, and says so
-honestly for the peer. Making the peer real needs the agent to answer questions — and
-on Linux the agent has **no local IPC transport at all**. `pipe.rs` is Windows-only
-named pipes; the Linux equivalent (a Unix socket in `$XDG_RUNTIME_DIR`) does not exist.
+The Linux half is built and verified on the machine: a socket in `$XDG_RUNTIME_DIR`,
+same dispatch as the named pipe, mode `0600` inside a `0700` directory, stale-socket
+detection that refuses to steal a live agent's path, and clean removal on `SIGTERM`.
+Measurements in [docs/status.md](docs/status.md).
 
-Once it does, the same request set serves both: monitors, audio devices, current
-topology, and applying a changed one. That turns the control app from an editor of its
-own in-memory state into an actual control surface.
+**The settings IPC is what remains, and it is now the top of this list.** The request set
+is still Hello/Ping/EnumerateWindows/Inject*/ReleaseAllInput, so the control app has
+nothing new to ask for and its peer panels are still placeholders. What it needs: a
+peer's monitors, its audio devices, the current topology, and applying a changed one.
+Both transports already carry it — the named pipe and the Unix socket locally, the QUIC
+channel for a peer — so this is the request set and the handlers, not another transport.
+
+**Decide the coordinate space before writing the monitor request, not after.** Windows
+reports physical pixels and Wayland logical ones. On one machine either is coherent;
+across two machines with different scale factors it is not defined which space the shared
+topology is expressed in, and getting it wrong puts edge crossings in the wrong place —
+only on mixed-DPI desks, which is exactly where nobody tests. This is listed under debt
+below and stops being theoretical the moment a monitor list crosses the wire.
 
 ### 3. Wire the KVM together as a daemon
 
@@ -181,8 +191,10 @@ as a deliberate later decision rather than something to attempt in passing.
    the machine; unrestricted on Windows, which has no mode bits, so any process running
    as this user can read it.
 
-3. **No local IPC on Linux.** `pipe.rs` is Windows-only. The control app cannot ask the
-   agent anything on Linux, so every peer-side panel stays a placeholder.
+3. ~~**No local IPC on Linux.**~~ **Resolved 2026-09-10** (`unix_socket.rs`). The
+   remaining half of the problem is that there is nothing worth asking yet: the request
+   set carries no monitors, no audio devices and no topology, so every peer-side panel
+   stays a placeholder for want of a *message*, not for want of a transport.
 
 4. **The ScreenCast picker**, as above. Approve-once is available and unverified; never-ask
    is a KWin plugin.
@@ -200,10 +212,11 @@ as a deliberate later decision rather than something to attempt in passing.
 
 ### Waiting on someone at the Arch machine
 
-- `sudo usermod -aG input $USER`, then re-login — unblocks evdev capture. **Attempted
-  over SSH 2026-09-09 and could not be done**: `sudo` on that machine requires a
-  password. Everything else on the Arch side — building, testing, the identity, pairing
-  and both ping directions — was completed remotely.
+- ~~`sudo usermod -aG input $USER`, then re-login~~ — **done 2026-09-10.**
+  `input-devices` now lists the real pointer and keyboard. The capture path itself has
+  still never been run: grabbing a keyboard on a machine nobody is sitting at is not
+  something to do unattended, so the first `kvm-source` run wants someone there with a
+  hand on Esc.
 - One ScreenCast picker approval — establishes the `restore_token`, and also confirms the
   scroll sign conventions, which are currently derived from documentation rather than
   measured.
@@ -232,7 +245,8 @@ Carried here so it is not rediscovered later:
 - **The peer's placement is persisted by the literal string "Peer (not connected)".**
   Fine while there is one placeholder peer; it needs to become a real device id the
   moment pairing exists.
-- **Mixed coordinate spaces across machines are unresolved.** Monitor geometry is stored
+- **Mixed coordinate spaces across machines are unresolved**, and this is now the next
+  thing that will bite rather than a distant concern — see item 2 above. Monitor geometry is stored
   in whatever the platform reports — physical pixels on Windows, logical on Wayland. On
   one machine that is coherent. Across two machines with different scale factors it is
   not yet defined which space the shared topology is expressed in, and getting it wrong
