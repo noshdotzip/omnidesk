@@ -737,17 +737,76 @@ does not exist. The arrangement rule does not depend on that — it takes whatev
 it is given — so the placeholder is already positioned by the same code a real peer will
 be.
 
+## Verified: a machine can read a peer's monitors (2026-09-10)
+
+`ListMonitors` completes the settings-IPC query set that exists today. Each platform crate
+gained a **windowless** enumerator, because the agent is headless and the control app's
+toolkit needs a window: `EnumDisplayMonitors` on Windows, `wl_output` + `xdg_output` on
+Wayland. Neither raises a permission dialog.
+
+Both directions, over the Wi-Fi link, against real hardware:
+
+- **Windows -> Arch**: `eDP-1`, 1920x1080 logical, 1920x1080 mode, scale 1.0, and
+  **144.028 Hz** — a refresh rate the toolkit path could never report on Linux, where
+  `tao`'s `video_modes()` is unsupported and always yields nothing.
+- **Arch -> Windows**: `\\.\DISPLAY1`, 2496x1664 at scale 1.5, primary.
+
+Every monitor is labelled with the sending machine's derived device id and checked against
+the key that completed the handshake, the same as audio endpoints. That check now has
+**one** implementation over a trait rather than one per answer type: two copies of a
+security check are two chances for one to be forgotten when the next answer is added, and
+the forgotten one is the exploitable one.
+
+### The second enumerator immediately caught a real bug
+
+The whole reason `apps/control/src/monitors.rs` warns against two backends is that they
+can disagree. They did, on the first run:
+
+| | reported | scale |
+|---|---|---|
+| agent (`EnumDisplayMonitors`) | 1664x1109 | 1.0 |
+| control app (`tao`) | 2496x1664 | 1.5 |
+
+Neither was wrong for its own process. The agent had never declared DPI awareness, so
+Windows handed it every rectangle **divided by the scale factor** and answered 96 DPI for
+every monitor — a lie that is entirely self-consistent and undetectable from inside the
+process. 1664 x 1.5 = 2496 is the whole explanation.
+
+Self-consistency is not enough here: the agent tells a *peer* this machine's geometry,
+reads positions the control app saved, and injects pointer coordinates in that same space.
+Two processes on one machine differing by a factor of 1.5 puts the pointer in the wrong
+place, and only on scaled displays — the ones most likely to be someone's actual laptop.
+The agent now declares per-monitor-v2 awareness before reading anything
+(`ultidesk_platform_windows::dpi`) and agrees with the toolkit.
+
+On Wayland the equivalent trap is different and was avoided by design rather than caught:
+`wl_output` reports a position in the compositor's global space and a size in *physical*
+pixels, which on a scaled output are different spaces. `xdg-output-unstable-v1` reports
+both logically, so that is what is read, and a compositor without it is refused rather
+than guessed at. This one could not have been caught by testing here — the Arch machine
+has a single 1.0-scale output, where the two spaces coincide.
+
+**392 tests on Windows ARM64.** Clippy `-D warnings` and `cargo fmt --check` clean on both
+machines.
+
+Note for anyone reproducing the Linux run over SSH: an SSH shell is not part of the
+graphical session, so the agent must be given `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`
+explicitly. Started normally inside the session it inherits both, and the error when it
+cannot connect says so.
+
 ## Exact next step
 
-The settings IPC's remaining half, now unblocked on the geometry question:
+**The relay.** The agent can now answer for itself — monitors and audio devices, over
+every transport — but the control app still talks to no agent: it enumerates in-process
+and its peer panels are placeholders. Making them real means the control app asking its
+local agent, and the local agent asking the peer.
 
-1. **`ListMonitors`.** The awkward part is unchanged: the control app reads monitors
-   through `tao`, which needs a window, and the agent is headless. Either the agent grows
-   a headless enumeration backend per platform — the "two backends, two chances to
-   disagree" that `apps/control/src/monitors.rs` warns against — or the control app stays
-   the only enumerator and the agent relays. The arrangement rule is indifferent to which:
-   it places whatever monitors it is handed.
-2. **The relay**, so the control app can ask rather than only the agent's CLI. The local
-   agent can vouch for its own answers and not for a peer's, so a relayed reply has to
-   carry the peer key it came from, or the ownership check that makes `peer-devices` safe
-   is lost the moment the control app is the one asking.
+The decision that has to come first: a relayed reply carries a device id the relaying
+machine cannot vouch for. The ownership check that makes `peer-devices` and
+`peer-monitors` safe lives in the *asking* process, and the moment the control app is the
+one asking, that check has to move with it — which means a relayed answer has to carry
+the peer key it came from, not just the payload.
+
+After that, the two enumerators become one: the control app should read monitors from the
+agent rather than from `tao`, which is what removes the disagreement documented above
+rather than merely detecting it.

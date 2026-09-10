@@ -47,9 +47,13 @@ by the discriminated unions in `apps/desktop/src/shared/protocol.ts`:
 - `InjectKey { scancode, down }` → `Injected` | `Error`
 - `ReleaseAllInput` → `Released { count }`
 - `ListAudioDevices` → `AudioDevices { devices: AudioDevice[] }` | `Error`
+- `ListMonitors` → `Monitors { monitors: Monitor[] }` | `Error`
 
-`ListAudioDevices` is the first of the settings surface, and the same message the peer
-channel carries. Every device it returns is labelled with the `DeviceId` of the machine
+`ListAudioDevices` and `ListMonitors` are the settings surface as it stands, and are the
+same messages the peer channel carries. A monitor's position is in the **sending
+machine's** coordinate space and is not comparable with the receiver's;
+`ultidesk_topology::arrange` places each machine's screens as one block precisely so that
+no absolute position ever crosses a machine boundary. Every device it returns is labelled with the `DeviceId` of the machine
 that owns it; over the peer channel the receiver checks that against the key that
 completed the handshake and rejects the whole list if any entry disagrees — see
 [ADR-0012](adrs/0012-device-identity.md). It answers about *this* machine only: relaying a

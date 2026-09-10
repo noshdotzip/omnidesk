@@ -76,17 +76,21 @@ answer checked against the key that was authenticated. What remains: **monitors*
 **the current topology**, and **applying a changed one** — plus the relay that lets the
 *control app* ask, rather than only the agent's CLI.
 
-Monitors are the awkward one, and the reason is worth knowing before starting: the
-control app reads them through `tao`, which needs a window, and the agent is headless. A
-`ListMonitors` request means either a second enumeration backend per platform — exactly
-the "two backends, two chances to disagree about the coordinate space" that
-`apps/control/src/monitors.rs` warns against — or making the control app the only
-enumerator and having the agent relay.
+~~Monitors are the awkward one~~ — **built 2026-09-10.** The agent got its own windowless
+enumerator per platform (`EnumDisplayMonitors`; `wl_output` + `xdg_output`), and both
+machines have read the other's real geometry. The "two backends, two chances to disagree"
+risk was real and paid off immediately: the two disagreed by a factor of 1.5 on the first
+run, because the agent had never declared DPI awareness. Fixed, and the fix is why the
+next item matters — the disagreement is currently *detected*, not *removed*.
 
 The relay has its own decision: the local agent can vouch for its own answers and not for
 a peer's, so a relayed reply has to carry the peer key it came from, or the ownership
-check that makes `peer-devices` safe is lost the moment the control app is the one
-asking.
+check that makes `peer-devices` and `peer-monitors` safe is lost the moment the control
+app is the one asking.
+
+Once the relay exists, the control app should read *its own* monitors from the agent too,
+rather than from `tao`. That is what removes the two-enumerator disagreement instead of
+only noticing it.
 
 ~~**Decide the coordinate space before writing the monitor request.**~~ **Decided and
 built 2026-09-10.** Machines start in a strip, left to right, in the order they
