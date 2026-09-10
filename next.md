@@ -92,10 +92,13 @@ Relaying turned out not to be a permission at all. A peer able to relay would re
 third machine it was never paired with using this one as a hop, so the gate grew a second
 axis — `LocalOnly` — that no grant can express.
 
-**What is left is the client.** The control app still speaks to no agent, so its peer
-panels are placeholders even though the answers are now one `AskPeer` away. Once it does
-speak, it should also read its *own* monitors from the agent rather than from `tao`, which
-removes the two-enumerator disagreement instead of only noticing it.
+~~**What is left is the client.**~~ **Built 2026-09-10.** `ultidesk-ipc` is a library now,
+and the control app reads both machines through one connection to its agent — including
+its own, which is what removes the two-enumerator disagreement rather than only noticing
+it. The window toolkit stays as the fallback for when no agent is running.
+
+**Item 2 is done.** What has not been done is *looking* at it: nobody has opened the
+control app and watched it draw a peer's real screen. That needs a person at a desk.
 
 ~~**Decide the coordinate space before writing the monitor request.**~~ **Decided and
 built 2026-09-10.** Machines start in a strip, left to right, in the order they
@@ -105,7 +108,7 @@ block's own width, no absolute position is ever compared across a machine bounda
 the physical-versus-logical mismatch cannot put a crossing in the wrong place. See
 `ultidesk_topology::arrange`.
 
-### 3. Wire the KVM together as a daemon
+### 3. Wire the KVM together as a daemon — **now the top of this list**
 
 With a transport and an IPC surface, goal 1 becomes real: `serve` watches the pointer,
 consults `Layout` for shared borders, drives `KvmMachine`, and forwards through the

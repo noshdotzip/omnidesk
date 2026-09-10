@@ -840,19 +840,66 @@ alone decides who a connection is. A missing address therefore has no security m
 which is why adding the field needed no schema bump — unlike a missing permission, where
 absence had to be read as "granted nothing".
 
+## Verified: the control app asks its agent (2026-09-10)
+
+The peer panels were placeholders, and not for want of an answer — the agent has been able
+to report a peer's monitors and endpoints for two commits. They were placeholders for want
+of a *message the app could name*, because the wire types lived inside the agent binary.
+
+`ultidesk-ipc` is now a library: the message types, the handshake descriptor, and a client
+that finds the agent, authenticates and asks. What deliberately did **not** move is the
+gate — enforcement belongs on the machine providing the capability, and a client knowing
+the shape of a request has never been what authorises it.
+
+Verified against live agents on both machines, over both transports:
+
+| | asked | got |
+|---|---|---|
+| Windows, named pipe | `ask monitors` | `\\.\DISPLAY1`, 2496x1664, scale 1.5 |
+| Windows, named pipe | `ask devices` | 3 endpoints |
+| Windows -> Arch, relayed | `ask-peer monitors` | `eDP-1`, 1920 wide, 144.028 Hz |
+| Windows -> Arch, relayed | `ask-peer devices` | 6 endpoints |
+| Arch, Unix socket | `ask monitors` | `eDP-1`, 144.028 Hz |
+| Arch, Unix socket | `ask devices` | 6 endpoints |
+
+`ask` and `ask-peer` go through the *running* agent rather than doing the work in-process,
+which is what makes them a test of the path the UI depends on rather than of a parallel
+one.
+
+**The control app now reads both machines through that one connection — including its
+own.** That is the point rather than a convenience. Two enumerators on one machine already
+disagreed by a factor of 1.5 (see the DPI section above); the bug is fixed, but the class
+of bug only goes away when there is one source, and the agent's numbers are the ones a
+peer is told. The window toolkit stays as the fallback for when no agent is running.
+
+Both panels degrade in halves rather than all at once: this machine's endpoints stay real
+when the peer is asleep, a peer that cannot be reached keeps its placeholder rather than
+vanishing and silently dropping the arrangement made of it, and "not paired" and "paired
+but unreachable" are different messages because they have different fixes.
+
+A stale handshake file — one left behind by an agent that died — used to surface as *"the
+system cannot find the file specified"*, describing a pipe nobody had asked about. It now
+reads as `no agent is running on this machine (a handshake file names …, but nothing is
+listening)`.
+
+**403 tests on Windows ARM64, 409 on Arch.** Clippy `-D warnings` and `cargo fmt --check`
+clean on both.
+
+**Not verified**: the control app's *window*. Everything above exercises the same client
+code the UI calls, but nobody has watched the editor draw a peer's real screen — that
+needs someone at a desk, and on the Arch machine a GUI launched over SSH hits the
+`global-hotkey` X11 crash recorded in ADR-0010.
+
 ## Exact next step
 
-**Put the control app on the relay.** Everything under it now exists: the agent answers
-for itself and for a peer, over a transport that exists on both platforms. What is missing
-is the client — the control app still enumerates in-process and its peer panels are
-placeholders, because nothing in it speaks the local IPC.
+**Look at it.** Every piece of the settings surface is now built and exercised
+head-lessly, and the one thing nobody has done is open the control app and see a peer's
+real monitor drawn next to the local one. That wants a person at one of the machines; on
+Arch it also wants a real session rather than SSH, because of the `global-hotkey` crash in
+[ADR-0010](adrs/0010-dioxus-control-ui.md).
 
-Two things follow immediately once it does, and both are the point rather than extras:
-
-1. The peer panels stop being placeholders — a peer's monitors and audio endpoints are one
-   `AskPeer` away, and `ultidesk_topology::left_to_right` already places whatever monitors
-   it is handed.
-2. The control app should read *its own* monitors from the agent too, rather than from
-   `tao`. That is what removes the two-enumerator disagreement documented above instead of
-   only detecting it — and the DPI bug it caught is the argument for doing it.
-
+After that, the next unbuilt thing is the one the whole settings surface was for:
+**wiring the KVM together as a daemon** (next.md item 3). Everything it needs now exists —
+an authenticated channel, a topology both machines agree on, evdev capture unblocked, and
+uinput injection that needs no dialog. What is missing is the assembly: something that
+watches the pointer, notices it hit a shared edge, and hands over.

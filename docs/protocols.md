@@ -14,6 +14,10 @@ covers the delta. The agent IPC also checks it during `Hello` and returns
 
 ## Local IPC (implemented)
 
+The message types, the handshake descriptor and a client live in `crates/ipc`, so both
+ends speak the same shapes. The **gate** does not: deciding whether a request is allowed
+happens in the agent, beside the thing it protects.
+
 Transport: a **Windows named pipe** or a **Unix socket**, newline-delimited JSON, one
 response per request in order. The agent writes its address and a per-launch token to a
 handshake file (`agent-endpoint.json`) in the session's runtime directory; the client
