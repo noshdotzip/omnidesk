@@ -694,22 +694,60 @@ understand grants less than intended rather than more.
 someone decides what it costs — a `_ => None` would let the next message ship ungated and
 do it silently.
 
+## Decided and built: how two machines' screens are arranged (2026-09-10)
+
+The starting arrangement is a **strip, left to right, in the order machines connected**
+(`ultidesk_topology::arrange`), and whatever the operator drags is remembered.
+
+- The first machine keeps the desktop its platform reports, so a single-machine desk is
+  untouched and matches what the OS shows.
+- Each machine after it is translated so its left edge meets the previous machine's right
+  edge. The two end up sharing a full-height border, so the pointer can cross before
+  anyone has arranged anything.
+- Each machine moves as **one block**, never monitor by monitor. Within a machine the
+  virtual desktop is one coordinate space and two screens edge to edge share an exact
+  boundary; nudging them independently turns that into a gap, `adjacency` reports no
+  shared border, and the pointer stops crossing *within* that machine. A translation
+  preserves differences, so a block move cannot do that.
+
+**This settles the coordinate-space question**, which was blocking the monitor message and
+could not be settled by measurement on the hardware here. Placing machines by their
+reported absolute positions would mix physical and logical space. Nothing does: the offset
+comes from the previous block's own measured width, so only distances *within* one machine
+are ever compared, and those are self-consistent whatever the platform means by them.
+
+What is left of the problem, and deliberately left: relative **sizes** are still not
+comparable across machines, so a 150%-scaled desktop is drawn larger than an unscaled one
+of the same physical size. That is a display problem, not a correctness one, and the
+obvious fix — rescaling each monitor by its own factor — is exactly what would break the
+internal adjacency above.
+
+**Saved layouts are keyed by device *and* name.** `eDP-1` is a name two laptops both
+report; matching on it alone would have applied one machine's saved position to the
+other's screen, silently, and only on desks where both name their panels the same. An
+entry written before layouts could hold two machines carries no device and still matches
+by name — what it meant when it was written — and re-saving upgrades it, so the looser
+match applies once and then stops.
+
+**378 tests on Windows ARM64, 384 on Arch.** Clippy `-D warnings` and `cargo fmt --check`
+clean on both.
+
+Not done: the peer in the editor is still a placeholder screen, because `ListMonitors`
+does not exist. The arrangement rule does not depend on that — it takes whatever monitors
+it is given — so the placeholder is already positioned by the same code a real peer will
+be.
+
 ## Exact next step
 
-Unchanged by this work, and still the settings IPC:
+The settings IPC's remaining half, now unblocked on the geometry question:
 
-1. **Monitors**, and the reason they are awkward before starting: the control app reads
-   them through `tao`, which needs a window, and the agent is headless. A `ListMonitors`
-   request means either a second enumeration backend per platform — exactly the "two
-   backends, two chances to disagree about the coordinate space" that
-   `apps/control/src/monitors.rs` warns against — or making the control app the only
-   enumerator and having the agent relay.
+1. **`ListMonitors`.** The awkward part is unchanged: the control app reads monitors
+   through `tao`, which needs a window, and the agent is headless. Either the agent grows
+   a headless enumeration backend per platform — the "two backends, two chances to
+   disagree" that `apps/control/src/monitors.rs` warns against — or the control app stays
+   the only enumerator and the agent relays. The arrangement rule is indifferent to which:
+   it places whatever monitors it is handed.
 2. **The relay**, so the control app can ask rather than only the agent's CLI. The local
    agent can vouch for its own answers and not for a peer's, so a relayed reply has to
    carry the peer key it came from, or the ownership check that makes `peer-devices` safe
    is lost the moment the control app is the one asking.
-
-The coordinate-space decision in next.md still stands ahead of any monitor message. It
-cannot be settled by measurement on the hardware here: the Arch machine has a single
-1.0-scale output, so nothing on this desk distinguishes a platform that reports monitor
-*positions* in logical space from one that reports them in physical.

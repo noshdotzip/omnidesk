@@ -88,12 +88,13 @@ a peer's, so a relayed reply has to carry the peer key it came from, or the owne
 check that makes `peer-devices` safe is lost the moment the control app is the one
 asking.
 
-**Decide the coordinate space before writing the monitor request, not after.** Windows
-reports physical pixels and Wayland logical ones. On one machine either is coherent;
-across two machines with different scale factors it is not defined which space the shared
-topology is expressed in, and getting it wrong puts edge crossings in the wrong place —
-only on mixed-DPI desks, which is exactly where nobody tests. This is listed under debt
-below and stops being theoretical the moment a monitor list crosses the wire.
+~~**Decide the coordinate space before writing the monitor request.**~~ **Decided and
+built 2026-09-10.** Machines start in a strip, left to right, in the order they
+connected, each machine's desktop translated as one block; the operator's arrangement is
+then remembered per device and monitor name. Because the offset comes from the previous
+block's own width, no absolute position is ever compared across a machine boundary, so
+the physical-versus-logical mismatch cannot put a crossing in the wrong place. See
+`ultidesk_topology::arrange`.
 
 ### 3. Wire the KVM together as a daemon
 
@@ -257,8 +258,11 @@ Carried here so it is not rediscovered later:
 - **The peer's placement is persisted by the literal string "Peer (not connected)".**
   Fine while there is one placeholder peer; it needs to become a real device id the
   moment pairing exists.
-- **Mixed coordinate spaces across machines are unresolved**, and this is now the next
-  thing that will bite rather than a distant concern — see item 2 above. Monitor geometry is stored
+- **Relative monitor *sizes* are still not comparable across machines.** Positions are
+  settled (see item 2), but a 150%-scaled desktop is drawn larger than an unscaled one of
+  the same physical size, because the editor has no physical dimensions to work from. It
+  is a display problem rather than a correctness one, and the obvious fix — rescaling each
+  monitor by its own factor — is exactly what breaks adjacency *within* a machine. Monitor geometry is stored
   in whatever the platform reports — physical pixels on Windows, logical on Wayland. On
   one machine that is coherent. Across two machines with different scale factors it is
   not yet defined which space the shared topology is expressed in, and getting it wrong
