@@ -46,6 +46,15 @@ by the discriminated unions in `apps/desktop/src/shared/protocol.ts`:
 - `InjectMouseButton { button, down }` → `Injected` | `Error`
 - `InjectKey { scancode, down }` → `Injected` | `Error`
 - `ReleaseAllInput` → `Released { count }`
+- `ListAudioDevices` → `AudioDevices { devices: AudioDevice[] }` | `Error`
+
+`ListAudioDevices` is the first of the settings surface, and the same message the peer
+channel carries. Every device it returns is labelled with the `DeviceId` of the machine
+that owns it; over the peer channel the receiver checks that against the key that
+completed the handshake and rejects the whole list if any entry disagrees — see
+[ADR-0012](adrs/0012-device-identity.md). It answers about *this* machine only: relaying a
+peer's devices would be a different message, because the answer would carry a device id
+the relaying machine cannot vouch for.
 
 Safety: bounded message size (`MAX_MESSAGE_BYTES`), and the agent releases all held
 input if the connection drops.

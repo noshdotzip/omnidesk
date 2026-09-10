@@ -70,12 +70,23 @@ same dispatch as the named pipe, mode `0600` inside a `0700` directory, stale-so
 detection that refuses to steal a live agent's path, and clean removal on `SIGTERM`.
 Measurements in [docs/status.md](docs/status.md).
 
-**The settings IPC is what remains, and it is now the top of this list.** The request set
-is still Hello/Ping/EnumerateWindows/Inject*/ReleaseAllInput, so the control app has
-nothing new to ask for and its peer panels are still placeholders. What it needs: a
-peer's monitors, its audio devices, the current topology, and applying a changed one.
-Both transports already carry it — the named pipe and the Unix socket locally, the QUIC
-channel for a peer — so this is the request set and the handlers, not another transport.
+**The settings IPC is started.** `ListAudioDevices` landed on 2026-09-10 and both
+machines have read the other's real endpoints over the authenticated channel, with the
+answer checked against the key that was authenticated. What remains: **monitors**,
+**the current topology**, and **applying a changed one** — plus the relay that lets the
+*control app* ask, rather than only the agent's CLI.
+
+Monitors are the awkward one, and the reason is worth knowing before starting: the
+control app reads them through `tao`, which needs a window, and the agent is headless. A
+`ListMonitors` request means either a second enumeration backend per platform — exactly
+the "two backends, two chances to disagree about the coordinate space" that
+`apps/control/src/monitors.rs` warns against — or making the control app the only
+enumerator and having the agent relay.
+
+The relay has its own decision: the local agent can vouch for its own answers and not for
+a peer's, so a relayed reply has to carry the peer key it came from, or the ownership
+check that makes `peer-devices` safe is lost the moment the control app is the one
+asking.
 
 **Decide the coordinate space before writing the monitor request, not after.** Windows
 reports physical pixels and Wayland logical ones. On one machine either is coherent;
@@ -191,10 +202,10 @@ as a deliberate later decision rather than something to attempt in passing.
    the machine; unrestricted on Windows, which has no mode bits, so any process running
    as this user can read it.
 
-3. ~~**No local IPC on Linux.**~~ **Resolved 2026-09-10** (`unix_socket.rs`). The
-   remaining half of the problem is that there is nothing worth asking yet: the request
-   set carries no monitors, no audio devices and no topology, so every peer-side panel
-   stays a placeholder for want of a *message*, not for want of a transport.
+3. ~~**No local IPC on Linux.**~~ **Resolved 2026-09-10** (`unix_socket.rs`), and the
+   request set has started growing: `ListAudioDevices` works between the two machines.
+   What is left is monitors, topology, and the relay that lets the control app ask
+   instead of only the agent's CLI — see item 2 above.
 
 4. **The ScreenCast picker**, as above. Approve-once is available and unverified; never-ask
    is a KWin plugin.

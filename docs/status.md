@@ -610,16 +610,72 @@ Recorded because both are about the *shape* of the tests rather than the code:
 nothing new to ask for. Monitors, audio devices and topology are the settings IPC, and
 that is the next piece.
 
+## Verified: a machine can read a peer's audio devices (2026-09-10)
+
+The first settings-IPC message, and the first time one machine learns something real
+about the other instead of showing a placeholder. `ListAudioDevices` is answered by the
+same `Session` all four transports share, so it works over the named pipe, the Unix
+socket, the dev TCP path and the QUIC channel without any of them knowing about it.
+
+Both directions, over the Wi-Fi link, against real hardware:
+
+- **Windows -> Arch**: 6 PipeWire endpoints — two HDMI outputs, the chipset speaker, and
+  two microphones — every one labelled `2301d188-…`, the Arch machine's derived device
+  id.
+- **Arch -> Windows**: 3 WASAPI endpoints — `Headphones (AirPods)`,
+  `Speakers (Qualcomm(R) Aqstic(TM) …)` and the microphone array — every one labelled
+  `4d2b951b-…`, the Windows machine's derived id.
+
+**The answer is checked against the identity that was authenticated.** The peer fills in
+the owning `DeviceId` itself, so nothing stops a compromised one from labelling its
+endpoints with another machine's id — which would silently re-point a saved audio route
+at a device on a third machine. It cannot, and only because the id is derived from the
+public key ([ADR-0012](adrs/0012-device-identity.md)): the receiver knows which key
+completed the handshake and computes the id that key is entitled to. Against a random
+uuid there would be nothing to compare. One forged entry rejects the whole list rather
+than being filtered out.
+
+That refusal is unit-tested rather than demonstrated live — making a peer lie would mean
+shipping a lying agent — but the check runs on every one of the live calls above, and
+passing it is why they returned at all.
+
+**350 tests on Windows ARM64, 356 on Arch.** Clippy `-D warnings` and `cargo fmt --check`
+clean on both.
+
+Two seams this needed, recorded because the next messages will use them:
+
+- `Backends` bundles what a session can be asked about. Injection is something a peer
+  *does to* this machine; audio is something the machine *reports about itself*. One
+  trait for both would leave a future per-peer permission check unable to tell them
+  apart. Bundled rather than passed one argument at a time, because monitors and topology
+  are next and a dispatcher signature that grows per capability drags four transports and
+  every test with it.
+- The platform-DTO-to-`AudioDevice` mapping moved into the platform crate that owns the
+  DTO. It was duplicated in the control app, and it encodes which field a saved route is
+  keyed on — two copies are two chances for the editor and the agent to disagree about
+  that, and the disagreement would surface as saved routes quietly failing to match.
+
+**What is still missing before the control app's peer panel can be real**: the app talks
+to no agent. It enumerates its own devices in-process, and asking a *peer* means asking
+the local agent to relay — which is a message that does not exist, because the answer
+would then carry a device id the local agent cannot vouch for. That relay, and its
+verification story, is the next decision.
+
 ## Exact next step
 
-The settings IPC: extend the request set so the control app can ask an agent for its
-monitors, its audio devices and its current topology, and apply a changed one. Both
-transports already carry it — the named pipe locally, and the QUIC channel for a peer —
-so this is the request set and the handlers, not another transport.
+Continue the settings IPC. Two pieces, in this order:
 
-One decision has to be made first and is written down in next.md rather than discovered
-later: **which coordinate space a peer's monitor geometry is expressed in**. Windows
-reports physical pixels and Wayland reports logical ones. On one machine that is
-coherent; across two with different scale factors it is not, and getting it wrong puts
-edge crossings in the wrong place on mixed-DPI desks — which is exactly where nobody
-tests.
+1. **Monitors.** Harder than audio and worth knowing why before starting: the control app
+   reads monitors through `tao`, which needs a window, and the agent is headless.
+   Answering a `ListMonitors` request means a second enumeration backend per platform —
+   exactly the "two backends, two chances to disagree about the coordinate space" that
+   `apps/control/src/monitors.rs` warns against. Decide whether the agent grows a
+   headless backend or the control app becomes the only enumerator and the agent relays.
+2. **The relay.** The control app speaks to its local agent; a peer's devices arrive over
+   that agent's QUIC connection. The local agent can vouch for its own answers and not
+   for a peer's, so a relayed reply has to carry the peer key it came from — otherwise
+   the ownership check that makes `peer-devices` safe is lost the moment the control app
+   is the one asking.
+
+Before either, the coordinate-space decision in next.md still stands: it stops being
+theoretical the moment a monitor list crosses the wire.
