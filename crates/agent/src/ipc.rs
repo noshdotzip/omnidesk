@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use ultidesk_core::protocol::PROTOCOL_VERSION;
 use ultidesk_identity::Permissions;
 use ultidesk_platform_windows::inject::{InputError, MouseButton, VirtualScreen};
-use ultidesk_topology::AudioDevice;
+use ultidesk_topology::{AudioDevice, Monitor};
 
 /// Requests the desktop app sends to the agent over local IPC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,6 +49,12 @@ pub enum IpcRequest {
     /// This machine's audio endpoints. Read-only, and the first message of the settings
     /// surface: the control app cannot show a peer's devices without asking for them.
     ListAudioDevices,
+    /// This machine's monitors, in its own virtual-desktop coordinates.
+    ///
+    /// Positions are *not* comparable with another machine's — see
+    /// `ultidesk_topology::arrange`, which places each machine's screens as one block
+    /// precisely so no absolute position ever crosses a machine boundary.
+    ListMonitors,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +74,9 @@ pub enum IpcResponse {
     },
     AudioDevices {
         devices: Vec<AudioDevice>,
+    },
+    Monitors {
+        monitors: Vec<Monitor>,
     },
     Error {
         code: String,
@@ -148,6 +157,16 @@ pub trait AudioInventory {
     fn devices(&self) -> Result<Vec<AudioDevice>, String>;
 }
 
+/// What this machine can say about its own screens.
+///
+/// Alongside [`AudioInventory`] rather than merged with it: they fail independently — a
+/// machine can have a working compositor and a broken audio daemon — and a caller that
+/// asked for one should not be told about the other's problem.
+pub trait MonitorInventory {
+    /// The monitors, or an operator-facing reason there are none.
+    fn monitors(&self) -> Result<Vec<Monitor>, String>;
+}
+
 /// The local capabilities a session may be asked about.
 ///
 /// Bundled rather than passed one argument at a time because the settings surface is
@@ -162,6 +181,7 @@ pub trait AudioInventory {
 pub struct Backends<'a> {
     pub injector: &'a dyn Injector,
     pub audio: &'a dyn AudioInventory,
+    pub monitors: &'a dyn MonitorInventory,
 }
 
 /// Real audio enumeration, backed by whichever platform this build targets.
@@ -202,6 +222,40 @@ impl AudioInventory for RealAudioInventory {
     }
 }
 
+/// Real monitor enumeration, backed by whichever platform this build targets.
+///
+/// Carries the device id for the same reason [`RealAudioInventory`] does: every monitor
+/// it returns is labelled with this machine's identity, and that label is what lets a
+/// receiver check the answer against the key it authenticated.
+pub struct RealMonitorInventory {
+    device_id: ultidesk_core::DeviceId,
+}
+
+impl RealMonitorInventory {
+    pub fn new(device_id: ultidesk_core::DeviceId) -> Self {
+        RealMonitorInventory { device_id }
+    }
+}
+
+impl MonitorInventory for RealMonitorInventory {
+    fn monitors(&self) -> Result<Vec<Monitor>, String> {
+        #[cfg(target_os = "linux")]
+        {
+            ultidesk_platform_linux::monitors::enumerate_shared(self.device_id)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(windows)]
+        {
+            ultidesk_platform_windows::monitors::enumerate_shared(self.device_id)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            Err("monitor enumeration is not implemented for this platform".into())
+        }
+    }
+}
+
 /// The backends a transport owns and lends to each connection.
 ///
 /// `Backends` borrows; this owns. A transport serves many connections from one set of
@@ -210,6 +264,7 @@ impl AudioInventory for RealAudioInventory {
 pub struct LocalBackends {
     pub injector: std::sync::Arc<dyn Injector + Send + Sync>,
     pub audio: std::sync::Arc<dyn AudioInventory + Send + Sync>,
+    pub monitors: std::sync::Arc<dyn MonitorInventory + Send + Sync>,
 }
 
 impl LocalBackends {
@@ -220,6 +275,7 @@ impl LocalBackends {
         LocalBackends {
             injector,
             audio: std::sync::Arc::new(RealAudioInventory::new(device_id)),
+            monitors: std::sync::Arc::new(RealMonitorInventory::new(device_id)),
         }
     }
 
@@ -227,6 +283,7 @@ impl LocalBackends {
         Backends {
             injector: self.injector.as_ref(),
             audio: self.audio.as_ref(),
+            monitors: self.monitors.as_ref(),
         }
     }
 }
@@ -290,7 +347,9 @@ fn required_permission(req: &IpcRequest) -> Option<Needed> {
         IpcRequest::ReleaseAllInput => None,
 
         IpcRequest::EnumerateWindows => Some(Needed::ListWindows),
-        IpcRequest::ListAudioDevices => Some(Needed::ReadDevices),
+        // Both describe what this machine *has*, which is one decision an operator makes
+        // once — unlike window titles, which say what they are doing.
+        IpcRequest::ListAudioDevices | IpcRequest::ListMonitors => Some(Needed::ReadDevices),
     }
 }
 
@@ -503,6 +562,10 @@ impl Session {
                 Ok(devices) => IpcResponse::AudioDevices { devices },
                 Err(message) => err("audio_unavailable", &message),
             },
+            IpcRequest::ListMonitors => match backends.monitors.monitors() {
+                Ok(monitors) => IpcResponse::Monitors { monitors },
+                Err(message) => err("monitors_unavailable", &message),
+            },
         }
     }
 
@@ -566,8 +629,39 @@ mod tests {
         }
     }
 
+    struct MockMonitors(Result<Vec<Monitor>, String>);
+    impl MonitorInventory for MockMonitors {
+        fn monitors(&self) -> Result<Vec<Monitor>, String> {
+            self.0.clone()
+        }
+    }
+
+    /// The monitor backend most tests do not care about.
+    fn no_monitors() -> MockMonitors {
+        MockMonitors(Ok(Vec::new()))
+    }
+
     fn backends<'a>(injector: &'a dyn Injector, audio: &'a dyn AudioInventory) -> Backends<'a> {
-        Backends { injector, audio }
+        Backends {
+            injector,
+            audio,
+            // Leaked so the borrow can outlive this call without every test having to
+            // declare a monitor backend it does not use. Test-only, and one small
+            // allocation per dispatch.
+            monitors: Box::leak(Box::new(no_monitors())),
+        }
+    }
+
+    fn backends_with<'a>(
+        injector: &'a dyn Injector,
+        audio: &'a dyn AudioInventory,
+        monitors: &'a dyn MonitorInventory,
+    ) -> Backends<'a> {
+        Backends {
+            injector,
+            audio,
+            monitors,
+        }
     }
 
     #[derive(Default)]
@@ -1005,6 +1099,10 @@ mod tests {
             Some(Needed::ReadDevices)
         );
         assert_eq!(
+            required_permission(&IpcRequest::ListMonitors),
+            Some(Needed::ReadDevices)
+        );
+        assert_eq!(
             required_permission(&IpcRequest::EnumerateWindows),
             Some(Needed::ListWindows)
         );
@@ -1014,6 +1112,91 @@ mod tests {
                 delta_y: 120
             }),
             Some(Needed::ControlInput)
+        );
+    }
+
+    fn a_monitor(device_id: ultidesk_core::DeviceId, name: &str, x: f64) -> Monitor {
+        Monitor {
+            device_id,
+            monitor_id: ultidesk_topology::MonitorId(1),
+            friendly_name: name.to_string(),
+            logical_x: x,
+            logical_y: 0.0,
+            logical_width: 1920.0,
+            logical_height: 1080.0,
+            native_pixel_width: 1920,
+            native_pixel_height: 1080,
+            scale_factor: 1.0,
+            rotation: ultidesk_topology::Rotation::Landscape,
+            refresh_rate: None,
+            primary: true,
+        }
+    }
+
+    #[test]
+    fn an_authenticated_session_gets_the_monitors() {
+        let (mut s, inj, audio) = authed();
+        let id = ultidesk_core::DeviceId::new();
+        let monitors = MockMonitors(Ok(vec![
+            a_monitor(id, "eDP-1", 0.0),
+            a_monitor(id, "HDMI-A-1", 1920.0),
+        ]));
+
+        match s.handle(
+            IpcRequest::ListMonitors,
+            &backends_with(&inj, &audio, &monitors),
+        ) {
+            IpcResponse::Monitors { monitors } => {
+                assert_eq!(monitors.len(), 2);
+                assert_eq!(monitors[1].logical_x, 1920.0);
+                assert!(monitors.iter().all(|m| m.device_id == id));
+            }
+            other => panic!("expected Monitors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_machine_that_cannot_read_its_monitors_says_so() {
+        // A headless session is a real state, and it is not the same answer as "no
+        // screens" — an operator debugging an empty editor needs to tell them apart.
+        let (mut s, inj, audio) = authed();
+        let monitors = MockMonitors(Err("could not connect to the Wayland compositor".into()));
+
+        match s.handle(
+            IpcRequest::ListMonitors,
+            &backends_with(&inj, &audio, &monitors),
+        ) {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "monitors_unavailable");
+                assert!(message.contains("Wayland"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_peer_without_read_devices_cannot_list_monitors_either() {
+        // Screens and speakers are one decision: both describe what this machine has.
+        let mut s = peer_with(Permissions {
+            control_input: true,
+            read_devices: false,
+            list_windows: true,
+        });
+        let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
+        let monitors = MockMonitors(Ok(vec![a_monitor(
+            ultidesk_core::DeviceId::new(),
+            "eDP-1",
+            0.0,
+        )]));
+
+        let r = s.handle(
+            IpcRequest::ListMonitors,
+            &backends_with(&inj, &audio, &monitors),
+        );
+        assert!(
+            matches!(r, IpcResponse::Error { ref code, .. } if code == "not_permitted"),
+            "{r:?}"
         );
     }
 

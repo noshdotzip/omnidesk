@@ -26,6 +26,9 @@
 //!                              latency of the real path. Injects nothing.
 //!   ultidesk-agent peer-devices Print a paired peer's audio endpoints as JSON, refusing
 //!                              any the peer labels as another machine's.
+//!   ultidesk-agent monitors    Print this machine's monitors as JSON. Needs no window
+//!                              and raises no permission dialog.
+//!   ultidesk-agent peer-monitors Print a paired peer's monitors, with the same check.
 //!   ultidesk-agent uinput-test Move the pointer through a square using virtual
 //!                              input devices. Linux only. Raises NO permission
 //!                              dialog and DOES move the real cursor.
@@ -61,6 +64,11 @@ use anyhow::{Context, Result};
 use ipc::Injector;
 
 fn main() -> Result<()> {
+    // Before anything reads a coordinate. A DPI-unaware process is shown monitor
+    // rectangles divided by the scale factor and a scale of 1.0 for every monitor — a
+    // self-consistent lie that only breaks once those numbers reach another process.
+    // See `ultidesk_platform_windows::dpi`.
+    ultidesk_platform_windows::dpi::make_process_per_monitor_aware();
     init_tracing();
     let mode = std::env::args()
         .nth(1)
@@ -76,6 +84,8 @@ fn main() -> Result<()> {
         "serve-peer" => serve_peer(),
         "peer-ping" => peer_ping(),
         "peer-devices" => peer_devices(),
+        "monitors" => monitors(),
+        "peer-monitors" => peer_monitors(),
         "pair" => pair(),
         "peers" => peers(),
         "kvm-demo" => kvm_demo(),
@@ -91,7 +101,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|monitors|peer-monitors|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -557,15 +567,55 @@ fn peer_ping() -> Result<()> {
     rt.block_on(quic::peer_ping(&identity, &store, addr, count))
 }
 
-/// Ask a paired peer for its audio endpoints — the first settings-IPC message.
-fn peer_devices() -> Result<()> {
+/// Print this machine's monitors as JSON, read without a window.
+///
+/// Read-only, and raises no permission dialog on either platform: on Windows it walks
+/// Win32, and on Linux it asks the compositor for its outputs, which any Wayland client
+/// may do.
+fn monitors() -> Result<()> {
+    use ipc::MonitorInventory;
+    let (_dir, identity) = local_identity()?;
+    let monitors = ipc::RealMonitorInventory::new(identity.device_id())
+        .monitors()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    tracing::info!(count = monitors.len(), "enumerated monitors");
+    println!("{}", serde_json::to_string_pretty(&monitors)?);
+    Ok(())
+}
+
+/// Ask a paired peer for its monitors.
+fn peer_monitors() -> Result<()> {
+    let (addr, dir, identity) = peer_query_args("peer-monitors")?;
+    let store = load_peers(&dir, identity.public())?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let monitors = rt.block_on(quic::peer_monitors(&identity, &store, addr))?;
+    println!("{}", serde_json::to_string_pretty(&monitors)?);
+    tracing::info!(count = monitors.len(), "read a peer's monitors");
+    Ok(())
+}
+
+/// The address, config directory and identity every peer query needs.
+fn peer_query_args(
+    command: &str,
+) -> Result<(
+    std::net::SocketAddr,
+    std::path::PathBuf,
+    ultidesk_identity::Identity,
+)> {
     let addr: std::net::SocketAddr = std::env::args()
         .nth(2)
-        .ok_or_else(|| anyhow::anyhow!("usage: ultidesk-agent peer-devices <host:port>"))?
+        .ok_or_else(|| anyhow::anyhow!("usage: ultidesk-agent {command} <host:port>"))?
         .parse()
         .context("the peer address must be host:port")?;
-
     let (dir, identity) = local_identity()?;
+    Ok((addr, dir, identity))
+}
+
+/// Ask a paired peer for its audio endpoints — the first settings-IPC message.
+fn peer_devices() -> Result<()> {
+    let (addr, dir, identity) = peer_query_args("peer-devices")?;
     let store = load_peers(&dir, identity.public())?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()

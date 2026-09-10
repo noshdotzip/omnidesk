@@ -307,6 +307,57 @@ pub async fn peer_audio_devices(
     peers: &PeerStore,
     addr: SocketAddr,
 ) -> anyhow::Result<Vec<ultidesk_topology::AudioDevice>> {
+    ask(
+        identity,
+        peers,
+        addr,
+        IpcRequest::ListAudioDevices,
+        |reply| match reply {
+            IpcResponse::AudioDevices { devices } => Ok(devices),
+            other => Err(other),
+        },
+    )
+    .await
+}
+
+/// Ask a paired peer what monitors it has.
+///
+/// The positions in the answer are in the *peer's* coordinate space and must not be
+/// compared with this machine's — `ultidesk_topology::arrange` places each machine's
+/// screens as one block precisely so that no absolute position ever crosses a machine
+/// boundary.
+pub async fn peer_monitors(
+    identity: &Identity,
+    peers: &PeerStore,
+    addr: SocketAddr,
+) -> anyhow::Result<Vec<ultidesk_topology::Monitor>> {
+    ask(
+        identity,
+        peers,
+        addr,
+        IpcRequest::ListMonitors,
+        |reply| match reply {
+            IpcResponse::Monitors { monitors } => Ok(monitors),
+            other => Err(other),
+        },
+    )
+    .await
+}
+
+/// One request, one reply, one ownership check.
+///
+/// Shared so that adding a query cannot accidentally add one that skips the check.
+async fn ask<T, F>(
+    identity: &Identity,
+    peers: &PeerStore,
+    addr: SocketAddr,
+    request: IpcRequest,
+    extract: F,
+) -> anyhow::Result<Vec<T>>
+where
+    T: OwnedByDevice,
+    F: FnOnce(IpcResponse) -> Result<Vec<T>, IpcResponse>,
+{
     let trusted = peers.keys();
     if trusted.is_empty() {
         anyhow::bail!("no peers are paired; run `ultidesk-agent pair` first");
@@ -325,9 +376,7 @@ pub async fn peer_audio_devices(
         .unwrap_or_else(|| peer_key.fingerprint());
 
     let mut stream = conn.open_control().await?;
-    stream
-        .send(&serde_json::to_vec(&IpcRequest::ListAudioDevices)?)
-        .await?;
+    stream.send(&serde_json::to_vec(&request)?).await?;
     let reply = stream
         .recv()
         .await?
@@ -335,31 +384,66 @@ pub async fn peer_audio_devices(
     stream.finish().await?;
     conn.close("done");
 
-    let devices = match serde_json::from_slice::<IpcResponse>(&reply)? {
-        IpcResponse::AudioDevices { devices } => devices,
-        IpcResponse::Error { code, message } => {
+    let items = match extract(serde_json::from_slice::<IpcResponse>(&reply)?) {
+        Ok(items) => items,
+        Err(IpcResponse::Error { code, message }) => {
             anyhow::bail!("{name} refused the request ({code}): {message}")
         }
-        other => anyhow::bail!("{name} answered ListAudioDevices with {other:?}"),
+        Err(other) => anyhow::bail!("{name} answered {request:?} with {other:?}"),
     };
 
-    check_owner(&devices, peer_key).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
-    Ok(devices)
+    check_owner(&items, peer_key).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    Ok(items)
 }
 
-/// Refuse a device list that claims to belong to a machine other than the one that
-/// proved its identity.
-fn check_owner(
-    devices: &[ultidesk_topology::AudioDevice],
-    peer_key: PeerKey,
-) -> Result<(), String> {
+/// Something a peer reports about itself, carrying the device it claims to belong to.
+///
+/// One trait so the ownership check has one implementation. Two copies of a security
+/// check are two chances for one of them to be forgotten when the next kind of answer is
+/// added — and the one that is forgotten is the one that is exploitable.
+trait OwnedByDevice {
+    fn owner(&self) -> ultidesk_core::DeviceId;
+    /// How to name this item in a refusal, so the operator can see which one was wrong.
+    fn label(&self) -> String;
+    /// What kind of thing it is, for the same reason.
+    fn kind() -> &'static str;
+}
+
+impl OwnedByDevice for ultidesk_topology::AudioDevice {
+    fn owner(&self) -> ultidesk_core::DeviceId {
+        self.device_id
+    }
+    fn label(&self) -> String {
+        self.node.clone()
+    }
+    fn kind() -> &'static str {
+        "endpoint"
+    }
+}
+
+impl OwnedByDevice for ultidesk_topology::Monitor {
+    fn owner(&self) -> ultidesk_core::DeviceId {
+        self.device_id
+    }
+    fn label(&self) -> String {
+        self.friendly_name.clone()
+    }
+    fn kind() -> &'static str {
+        "monitor"
+    }
+}
+
+/// Refuse a list that claims to belong to a machine other than the one that proved its
+/// identity.
+fn check_owner<T: OwnedByDevice>(items: &[T], peer_key: PeerKey) -> Result<(), String> {
     let expected = peer_key.device_id();
-    if let Some(bad) = devices.iter().find(|d| d.device_id != expected) {
+    if let Some(bad) = items.iter().find(|d| d.owner() != expected) {
         return Err(format!(
-            "endpoint {:?} is labelled as belonging to device {}, but the peer that sent \
-             it authenticated as {} ({})",
-            bad.node,
-            bad.device_id,
+            "{} {:?} is labelled as belonging to device {}, but the peer that sent it \
+             authenticated as {} ({})",
+            T::kind(),
+            bad.label(),
+            bad.owner(),
             expected,
             peer_key.fingerprint()
         ));
@@ -392,7 +476,7 @@ mod tests {
     fn an_empty_list_is_fine() {
         // A machine really can have no endpoints, and that is not a spoofing attempt.
         let key = Identity::from_secret_bytes([4u8; 32]).public();
-        assert_eq!(check_owner(&[], key), Ok(()));
+        assert_eq!(check_owner::<AudioDevice>(&[], key), Ok(()));
     }
 
     #[test]
@@ -405,6 +489,38 @@ mod tests {
         let err = check_owner(&[device(someone_else.device_id())], peer).unwrap_err();
         assert!(err.contains(&peer.fingerprint()), "{err}");
         assert!(err.contains("speakers"), "{err}");
+    }
+
+    fn a_monitor(device_id: ultidesk_core::DeviceId) -> ultidesk_topology::Monitor {
+        ultidesk_topology::Monitor {
+            device_id,
+            monitor_id: ultidesk_topology::MonitorId(1),
+            friendly_name: "eDP-1".into(),
+            logical_x: 0.0,
+            logical_y: 0.0,
+            logical_width: 1920.0,
+            logical_height: 1080.0,
+            native_pixel_width: 1920,
+            native_pixel_height: 1080,
+            scale_factor: 1.0,
+            rotation: ultidesk_topology::Rotation::Landscape,
+            refresh_rate: None,
+            primary: false,
+        }
+    }
+
+    #[test]
+    fn a_peer_cannot_label_its_monitors_as_another_machines_either() {
+        // The same check, over the other kind of answer — which is the point of it
+        // having one implementation rather than two.
+        let peer = Identity::from_secret_bytes([4u8; 32]).public();
+        let someone_else = Identity::from_secret_bytes([5u8; 32]).public();
+
+        assert_eq!(check_owner(&[a_monitor(peer.device_id())], peer), Ok(()));
+        let err = check_owner(&[a_monitor(someone_else.device_id())], peer).unwrap_err();
+        assert!(err.contains("monitor"), "{err}");
+        assert!(err.contains("eDP-1"), "{err}");
+        assert!(err.contains(&peer.fingerprint()), "{err}");
     }
 
     #[test]

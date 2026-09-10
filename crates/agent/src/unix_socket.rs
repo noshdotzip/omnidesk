@@ -254,7 +254,7 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{AudioInventory, Injector, WindowDto};
+    use crate::ipc::{AudioInventory, Injector, MonitorInventory, WindowDto};
     use ultidesk_core::protocol::PROTOCOL_VERSION;
     use ultidesk_platform_windows::inject::{InputError, MouseButton, VirtualScreen};
 
@@ -280,6 +280,13 @@ mod tests {
     struct NoAudio;
     impl AudioInventory for NoAudio {
         fn devices(&self) -> Result<Vec<ultidesk_topology::AudioDevice>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct NoMonitors;
+    impl MonitorInventory for NoMonitors {
+        fn monitors(&self) -> Result<Vec<ultidesk_topology::Monitor>, String> {
             Ok(Vec::new())
         }
     }
@@ -315,6 +322,7 @@ mod tests {
         let backends = Arc::new(crate::ipc::LocalBackends {
             injector: Arc::new(NoopInjector),
             audio: Arc::new(NoAudio),
+            monitors: Arc::new(NoMonitors),
         });
         let handle = tokio::spawn(serve(listener, token.clone(), backends));
 

@@ -114,7 +114,7 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::{AudioInventory, Injector, WindowDto};
+    use crate::ipc::{AudioInventory, Injector, MonitorInventory, WindowDto};
     use tokio::net::windows::named_pipe::ClientOptions;
     use ultidesk_core::protocol::PROTOCOL_VERSION;
     use ultidesk_platform_windows::inject::{InputError, MouseButton, VirtualScreen};
@@ -145,6 +145,13 @@ mod tests {
         }
     }
 
+    struct NoMonitors;
+    impl MonitorInventory for NoMonitors {
+        fn monitors(&self) -> Result<Vec<ultidesk_topology::Monitor>, String> {
+            Ok(Vec::new())
+        }
+    }
+
     async fn open_with_retry(name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
         for _ in 0..50 {
             match ClientOptions::new().open(name) {
@@ -162,6 +169,7 @@ mod tests {
         let backends = Arc::new(LocalBackends {
             injector: Arc::new(NoopInjector),
             audio: Arc::new(NoAudio),
+            monitors: Arc::new(NoMonitors),
         });
 
         let srv_name = name.clone();

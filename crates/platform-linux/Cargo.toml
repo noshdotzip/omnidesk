@@ -22,6 +22,12 @@ tracing = { workspace = true }
 # The D-Bus client is only pulled in when actually targeting Linux, so the workspace
 # still builds on Windows/macOS (where every entry point returns `Unsupported`).
 [target.'cfg(target_os = "linux")'.dependencies]
+# Monitor geometry comes from the compositor itself: any Wayland client may list
+# outputs, so this needs no window and raises no permission dialog — unlike the portals
+# that would otherwise have to be asked. `xdg-output` is the part that matters; see
+# `monitors.rs` on why `wl_output` alone is not enough.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 # Native PipeWire client. 0.10 is the first release that builds against PipeWire 1.6:
 # libspa 0.8 fails there because bindgen emits spa_pod_builder as an opaque type.
