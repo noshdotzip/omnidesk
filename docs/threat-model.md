@@ -21,7 +21,7 @@ defenses, and is explicit about what is implemented today vs. planned.
 | Spoofed device advertisement | Discovery is only a hint; connection requires the pinned identity | pinning **implemented + tested** end to end; discovery is not built, so an address is typed in |
 | Replayed control command | Session nonces, sequence numbers, monotonic timestamps | partial (seq/ts in schema) |
 | Stolen paired identity | Private key in OS secret store (DPAPI/Secret Service); revocation | **not implemented**: the key is a `0600` file on Unix and an unrestricted file on Windows. Revocation exists as `PeerStore::forget` |
-| Malicious but paired peer | **Source-side** permission enforcement; a receiver claiming a permission is not enough | design enforced (see permissions.md) |
+| Malicious but paired peer | **Source-side** permission enforcement; a receiver claiming a permission is not enough | **implemented + tested** for input, device reading and window listing, and verified between the two machines. Clipboard, files and projection have no requests yet, so there is nothing to gate |
 | Revoked peer reconnecting | Pinned-identity check refuses revoked keys | **implemented + tested**: refused during the handshake, by fingerprint, before any dispatcher is reached. `peers forget` revokes |
 | Unauthorized input injection | Input only accepted on an authenticated session with a valid lease; `can_forward_input` gated to `RemoteActive` | logic implemented + tested |
 | Input loops / replay (A→B→A, rings) | Layered guard: injection marker, origin id, hop TTL, event de-dup | **implemented + tested** (`core::input_guard`) |
@@ -53,9 +53,9 @@ the local physical user can always preempt and terminate remote access.
   `serve-peer-dev` are kept for bench comparison and carry keystrokes in the clear behind
   a shared token. They must not be used for anything else, and should be deleted once the
   KVM daemon runs on the QUIC channel.
-- **No per-peer permissions.** A paired peer may send every request the dispatcher
-  accepts. Source-side permission enforcement (permissions.md) is designed and not built,
-  so pairing is currently all-or-nothing.
+- **Per-peer permissions cover only the requests that exist** — input, device reading and
+  window listing. That is deliberate (a permission with nothing behind it cannot be
+  tested) but the set will grow, and the Work Device profile is not built at all.
 - **No discovery**, so a peer's address is typed in by hand.
 - **The device private key is not in OS secret storage.** It is a file: mode `0600` on
   Unix, and on Windows a normal file in `%APPDATA%` with no ACL restriction — the same

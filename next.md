@@ -189,11 +189,11 @@ as a deliberate later decision rather than something to attempt in passing.
 
 **Ordered by how much they hold back.**
 
-1. ~~**No secure transport.**~~ **Resolved and verified cross-machine 2026-09-09.** Both
-   machines are paired and carry traffic both ways. What replaces it at the top of this
-   list is **no per-peer permissions**: a paired peer may send every request the
-   dispatcher accepts, so "may control my input" and "may read my clipboard" are the same
-   decision. Source-side enforcement is designed in docs/permissions.md and not built.
+1. ~~**No secure transport.**~~ **Resolved and verified cross-machine 2026-09-09.**
+   ~~**No per-peer permissions.**~~ **Resolved 2026-09-10** and demonstrated between the
+   machines: three permissions with a request behind each, enforced source-side. What is
+   left of it is scope rather than mechanism — clipboard, files, projection approval and
+   the Work Device profile have no requests yet, so no permission is declared for them.
 
 2. ~~**No device identity or pairing.**~~ **Resolved 2026-09-09**, and the two real
    machines are paired (`ultidesk-identity`,
@@ -249,10 +249,11 @@ Carried here so it is not rediscovered later:
   checking that `XOpenDisplay` succeeded. A normal desktop launch is fine; a pure
   Wayland session with no XWayland is not. Recorded in
   [ADR-0010](docs/adrs/0010-dioxus-control-ui.md).
-- **A paired peer may send every request the dispatcher accepts.** Pairing is currently
-  all-or-nothing: there is no per-peer permission store, so "this machine may control me"
-  and "this machine may read my clipboard" are the same decision. Source-side enforcement
-  is designed in docs/permissions.md and not built.
+- **The permission set covers only what exists.** `control-input`, `read-devices` and
+  `list-windows` are enforced; clipboard, files, projection approval, audio streams and
+  the Work Device profile are not, because none of them has a request yet. That is the
+  intended order — a permission with nothing behind it cannot be tested — but it means
+  the store will grow, and each addition has to decide its own migration default.
 - **The peer's placement is persisted by the literal string "Peer (not connected)".**
   Fine while there is one placeholder peer; it needs to become a real device id the
   moment pairing exists.

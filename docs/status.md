@@ -661,21 +661,55 @@ the local agent to relay — which is a message that does not exist, because the
 would then carry a device id the local agent cannot vouch for. That relay, and its
 verification story, is the next decision.
 
+## Verified: per-peer permissions, enforced across the link (2026-09-10)
+
+A paired peer could previously send every request the dispatcher accepts. Pairing is now
+a decision about *what*, not only *who*: three permissions, each with a request behind it,
+enforced on the machine that owns the capability
+([permissions.md](permissions.md)).
+
+Demonstrated between the two machines, with Arch serving and Windows asking:
+
+- Arch revoked `read-devices` from the Windows peer. Windows asked anyway and was refused:
+  `arch-x64 refused the request (not_permitted): this device does not allow "read-devices"
+  for the peer on this session` — the message names the permission, so an operator knows
+  which grant to change rather than only that something failed.
+- `peer-ping` kept working while that revocation was in force, which is the point of
+  leaving liveness ungated.
+- Arch granted it back; the same call returned all 6 endpoints.
+- The Arch agent logs what each peer may do as it connects:
+  `peer connected peer=windows-arm64 allowed=["control-input", "read-devices", "list-windows"]`.
+
+**366 tests on Windows ARM64, 372 on Arch.** Clippy `-D warnings` and `cargo fmt --check`
+clean on both.
+
+Both machines' `peers.json` were v1 and migrated on this run: every peer kept the
+unrestricted access pairing used to mean, the grant was written back once so it is
+visible and revocable, and the warning stopped repeating on the next launch. Defaulting
+those peers to nothing would have broken a working setup with no explanation; within v2 a
+missing or unrecognised field still reads as `false`, so a store this build cannot fully
+understand grants less than intended rather than more.
+
+`required_permission` has no wildcard arm, so adding a request fails to compile until
+someone decides what it costs — a `_ => None` would let the next message ship ungated and
+do it silently.
+
 ## Exact next step
 
-Continue the settings IPC. Two pieces, in this order:
+Unchanged by this work, and still the settings IPC:
 
-1. **Monitors.** Harder than audio and worth knowing why before starting: the control app
-   reads monitors through `tao`, which needs a window, and the agent is headless.
-   Answering a `ListMonitors` request means a second enumeration backend per platform —
-   exactly the "two backends, two chances to disagree about the coordinate space" that
-   `apps/control/src/monitors.rs` warns against. Decide whether the agent grows a
-   headless backend or the control app becomes the only enumerator and the agent relays.
-2. **The relay.** The control app speaks to its local agent; a peer's devices arrive over
-   that agent's QUIC connection. The local agent can vouch for its own answers and not
-   for a peer's, so a relayed reply has to carry the peer key it came from — otherwise
-   the ownership check that makes `peer-devices` safe is lost the moment the control app
-   is the one asking.
+1. **Monitors**, and the reason they are awkward before starting: the control app reads
+   them through `tao`, which needs a window, and the agent is headless. A `ListMonitors`
+   request means either a second enumeration backend per platform — exactly the "two
+   backends, two chances to disagree about the coordinate space" that
+   `apps/control/src/monitors.rs` warns against — or making the control app the only
+   enumerator and having the agent relay.
+2. **The relay**, so the control app can ask rather than only the agent's CLI. The local
+   agent can vouch for its own answers and not for a peer's, so a relayed reply has to
+   carry the peer key it came from, or the ownership check that makes `peer-devices` safe
+   is lost the moment the control app is the one asking.
 
-Before either, the coordinate-space decision in next.md still stands: it stops being
-theoretical the moment a monitor list crosses the wire.
+The coordinate-space decision in next.md still stands ahead of any monitor message. It
+cannot be settled by measurement on the hardware here: the Arch machine has a single
+1.0-scale output, so nothing on this desk distinguishes a platform that reports monitor
+*positions* in logical space from one that reports them in physical.

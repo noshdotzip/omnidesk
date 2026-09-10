@@ -63,6 +63,42 @@ projection remembers approval.
 
 ## What is implemented today
 
-- The source-side enforcement *model* and the `input_blocked` surfacing are implemented.
-- The per-peer permission store, pairing, and Work Device runtime enforcement are
-  Milestone-1+ and not yet built. See [status.md](status.md).
+**Pairing and a per-peer permission store are built and enforced** (2026-09-10). Three
+permissions, each with a request actually behind it — none is declared ahead of one:
+
+| Permission | Gates | Default on pairing |
+|---|---|---|
+| `control-input` | pointer motion, buttons, keys, wheel | granted |
+| `read-devices` | this machine's audio endpoints (monitors and topology as they land) | granted |
+| `list-windows` | the window list, **titles included** | **not** granted |
+
+Window listing is separate from device reading because a title says what the operator is
+doing — the document open, the site being read, a customer's name — while an endpoint
+list says a machine has speakers. Granting one must not grant the other.
+
+Enforcement is source-side, as this document requires: the permissions come from the
+*receiving* machine's own store, keyed by the public key the handshake proved, read once
+per connection. A peer cannot assert its own and cannot change them by reconnecting under
+a different name.
+
+Two requests are ungated on purpose. `Ping`, because refusing liveness makes "the peer is
+gone" and "the peer denies me" indistinguishable and discloses nothing the completed
+handshake did not. `ReleaseAllInput`, because it only undoes what the session already
+did — a peer whose input permission is revoked mid-connection must still be able to drop
+a held modifier, or revoking a permission becomes the thing that leaves a key stuck down.
+
+The local IPC is allowed everything. The token holder is a process running as this user
+on this machine and could drive the same APIs directly; a check there would be theatre,
+and would make these peer checks look like the same gesture.
+
+Managed with `ultidesk-agent peers`, `peers allow <key> <perm>` and
+`peers deny <key> <perm>`.
+
+### Still not built
+
+- Everything else in the per-peer list above — clipboard, files, projection approval,
+  audio streams, reconnection — has no request behind it yet, and no permission is
+  declared for it in advance.
+- The **Work Device profile** as a whole, including approval-every-session, terminate-on-
+  lock, and the audit trail.
+- On-screen indicators and the tray, which the profile depends on.
