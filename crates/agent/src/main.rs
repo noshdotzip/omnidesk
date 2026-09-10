@@ -29,6 +29,9 @@
 //!   ultidesk-agent monitors    Print this machine's monitors as JSON. Needs no window
 //!                              and raises no permission dialog.
 //!   ultidesk-agent peer-monitors Print a paired peer's monitors, with the same check.
+//!   ultidesk-agent topology    Print the layout both machines share and where they
+//!                              touch — the first thing to check if the pointer will
+//!                              not cross. topology <peer host:port>
 //!   ultidesk-agent ask         Ask this machine's *running* agent over the local IPC,
 //!                              exactly as the control app does.
 //!                              ask <monitors|devices>
@@ -60,6 +63,7 @@ mod portal_injector;
 mod quic;
 mod relay;
 mod tcp;
+mod topology;
 #[cfg(target_os = "linux")]
 mod uinput_injector;
 #[cfg(unix)]
@@ -91,6 +95,7 @@ fn main() -> Result<()> {
         "peer-devices" => peer_devices(),
         "monitors" => monitors(),
         "peer-monitors" => peer_monitors(),
+        "topology" => topology_report(),
         "ask" => ask(false),
         "ask-peer" => ask(true),
         "pair" => pair(),
@@ -108,7 +113,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|monitors|peer-monitors|ask|ask-peer|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|monitors|peer-monitors|ask|ask-peer|topology|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -683,6 +688,96 @@ impl OwnedItem for ultidesk_topology::Monitor {
     fn owner(&self) -> ultidesk_core::DeviceId {
         self.device_id
     }
+}
+
+/// Where the pointer is, if this platform will say.
+///
+/// Windows will. Wayland deliberately will not: a client is told the pointer's position
+/// only while it is over that client's own surface, so a headless agent cannot ask. That
+/// is not a gap to work around here — it is why the Linux side dead-reckons instead.
+fn pointer_now() -> Option<(f64, f64)> {
+    #[cfg(windows)]
+    {
+        ultidesk_platform_windows::cursor::cursor_position().map(|(x, y)| (x as f64, y as f64))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Print the layout both machines' pointers share, and where they touch.
+///
+/// The diagnostic for the KVM: if the pointer will not cross, this says whether the two
+/// machines share a border at all — which is the first thing to know and, until now,
+/// nothing could answer.
+fn topology_report() -> Result<()> {
+    let addr: std::net::SocketAddr = match std::env::args().nth(2) {
+        Some(text) => text.parse().context("the peer address must be host:port")?,
+        None => anyhow::bail!("usage: ultidesk-agent topology <peer host:port>"),
+    };
+    let (dir, identity) = local_identity()?;
+    let store = load_peers(&dir, identity.public())?;
+
+    use ipc::MonitorInventory;
+    let local = ipc::RealMonitorInventory::new(identity.device_id())
+        .monitors()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let assembled = rt.block_on(topology::assemble(&identity, &store, local, addr))?;
+
+    for (i, m) in assembled.layout.monitors.iter().enumerate() {
+        let whose = if assembled.local.contains(&i) {
+            "this machine"
+        } else {
+            "peer"
+        };
+        println!(
+            "{i}: {:<24} {whose:<12} {}x{} at ({},{})",
+            m.friendly_name, m.logical_width, m.logical_height, m.logical_x, m.logical_y
+        );
+    }
+
+    // Where the pointer is, when the platform will say. It decides which screen a
+    // crossing would start from, so "the pointer is not where you think" is a real
+    // answer to "why will it not cross".
+    match pointer_now() {
+        Some((x, y)) => match assembled.local_monitor_at(x, y) {
+            Some(i) => println!(
+                "
+pointer at ({x},{y}) — on {}",
+                assembled.layout.monitors[i].friendly_name
+            ),
+            None => println!(
+                "
+pointer at ({x},{y}) — not on any of this machine's screens, which                  happens in the gap between two that are not flush"
+            ),
+        },
+        None => println!(
+            "
+pointer position: not available on this platform — Wayland does not tell a              client where the pointer is, which is why the KVM tracks it by dead reckoning              (see `ultidesk_platform_linux::pointer`)"
+        ),
+    }
+
+    let borders = assembled.shared_borders();
+    if borders.is_empty() {
+        println!();
+        println!("NO SHARED BORDER: the pointer cannot cross between these machines.");
+    }
+    for (from, to, adjacency) in borders {
+        println!();
+        println!(
+            "{} -> {} on its {:?}, {}px of shared edge",
+            assembled.layout.monitors[from].friendly_name,
+            assembled.layout.monitors[to].friendly_name,
+            adjacency.side,
+            adjacency.span()
+        );
+    }
+    Ok(())
 }
 
 /// Ask this machine's running agent something, exactly as the control app does.
