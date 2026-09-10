@@ -7,7 +7,7 @@
 //!
 //! (Included only on Windows via `#[cfg(windows)] mod pipe;` in main.rs.)
 
-use crate::ipc::{Injector, IpcRequest, IpcResponse, Session};
+use crate::ipc::{IpcRequest, IpcResponse, LocalBackends, Session};
 use anyhow::Context;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,10 +15,11 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use ultidesk_core::protocol::MAX_MESSAGE_BYTES;
 
 /// Serve the named pipe forever, accepting one client at a time.
-pub async fn serve<I>(pipe_name: String, token: String, injector: Arc<I>) -> anyhow::Result<()>
-where
-    I: Injector + Send + Sync + 'static,
-{
+pub async fn serve(
+    pipe_name: String,
+    token: String,
+    backends: Arc<LocalBackends>,
+) -> anyhow::Result<()> {
     // Claim the pipe name with the first instance, then keep one instance pre-created
     // and waiting so there is never a window where a client gets ERROR_FILE_NOT_FOUND.
     let mut server = ServerOptions::new()
@@ -35,19 +36,19 @@ where
             .context("failed to create next pipe instance")?;
 
         let token = token.clone();
-        let injector = injector.clone();
+        let backends = backends.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(connected, &token, injector.as_ref()).await {
+            if let Err(e) = handle_connection(connected, &token, backends.as_ref()).await {
                 tracing::warn!(error = %e, "ipc connection ended with error");
             }
         });
     }
 }
 
-async fn handle_connection<I: Injector>(
+async fn handle_connection(
     server: NamedPipeServer,
     token: &str,
-    injector: &I,
+    backends: &LocalBackends,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(server);
     let mut reader = BufReader::new(read_half);
@@ -80,7 +81,7 @@ async fn handle_connection<I: Injector>(
             continue;
         }
         let response = match serde_json::from_str::<IpcRequest>(trimmed) {
-            Ok(req) => session.handle(req, injector),
+            Ok(req) => session.handle(req, &backends.borrow()),
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),
@@ -92,7 +93,7 @@ async fn handle_connection<I: Injector>(
     };
 
     // Always release held input when the connection ends, however it ended.
-    let released = session.release_all(injector);
+    let released = session.release_all(backends.injector.as_ref());
     if released > 0 {
         tracing::info!(released, "released held input on connection close");
     }
@@ -113,7 +114,7 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::WindowDto;
+    use crate::ipc::{AudioInventory, Injector, WindowDto};
     use tokio::net::windows::named_pipe::ClientOptions;
     use ultidesk_core::protocol::PROTOCOL_VERSION;
     use ultidesk_platform_windows::inject::{InputError, MouseButton, VirtualScreen};
@@ -137,6 +138,13 @@ mod tests {
         }
     }
 
+    struct NoAudio;
+    impl AudioInventory for NoAudio {
+        fn devices(&self) -> Result<Vec<ultidesk_topology::AudioDevice>, String> {
+            Ok(Vec::new())
+        }
+    }
+
     async fn open_with_retry(name: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
         for _ in 0..50 {
             match ClientOptions::new().open(name) {
@@ -151,11 +159,14 @@ mod tests {
     async fn loopback_hello_ping_and_auth_enforced() {
         let name = format!(r"\\.\pipe\ultidesk-test-{}", uuid::Uuid::new_v4().simple());
         let token = "test-token".to_string();
-        let injector = Arc::new(NoopInjector);
+        let backends = Arc::new(LocalBackends {
+            injector: Arc::new(NoopInjector),
+            audio: Arc::new(NoAudio),
+        });
 
         let srv_name = name.clone();
         let srv_token = token.clone();
-        let handle = tokio::spawn(async move { serve(srv_name, srv_token, injector).await });
+        let handle = tokio::spawn(async move { serve(srv_name, srv_token, backends).await });
 
         let client = open_with_retry(&name).await;
         let (r, mut w) = tokio::io::split(client);

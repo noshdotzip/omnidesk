@@ -35,7 +35,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use ultidesk_core::protocol::MAX_MESSAGE_BYTES;
 
-use crate::ipc::{Injector, IpcRequest, IpcResponse, Session};
+use crate::ipc::{IpcRequest, IpcResponse, LocalBackends, Session};
 
 /// `sockaddr_un.sun_path` is a fixed 108-byte array on Linux, NUL terminated.
 ///
@@ -147,7 +147,7 @@ fn clear_stale(path: &Path) -> anyhow::Result<()> {
 pub async fn serve(
     listener: Listener,
     token: String,
-    injector: Arc<dyn Injector + Send + Sync>,
+    backends: Arc<LocalBackends>,
 ) -> anyhow::Result<()> {
     use tokio::signal::unix::{signal, SignalKind};
 
@@ -169,9 +169,9 @@ pub async fn serve(
         };
         let (stream, _addr) = accepted.context("accept failed on the IPC socket")?;
         let token = token.clone();
-        let injector = injector.clone();
+        let backends = backends.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &token, injector.as_ref()).await {
+            if let Err(e) = handle_connection(stream, &token, backends.as_ref()).await {
                 tracing::warn!(error = %e, "ipc connection ended with error");
             }
         });
@@ -187,7 +187,7 @@ pub async fn serve(
 async fn handle_connection(
     stream: UnixStream,
     token: &str,
-    injector: &(dyn Injector + Send + Sync),
+    backends: &LocalBackends,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -220,7 +220,7 @@ async fn handle_connection(
             continue;
         }
         let response = match serde_json::from_str::<IpcRequest>(trimmed) {
-            Ok(req) => session.handle(req, injector),
+            Ok(req) => session.handle(req, &backends.borrow()),
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),
@@ -233,7 +233,7 @@ async fn handle_connection(
 
     // However the connection ended, release what it was holding. A crashed control app
     // must not be able to leave a modifier down on the machine it was driving.
-    let released = session.release_all(injector);
+    let released = session.release_all(backends.injector.as_ref());
     if released > 0 {
         tracing::info!(released, "released held input on connection close");
     }

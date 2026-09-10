@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ultidesk_core::DeviceId;
+use ultidesk_topology::{AudioDevice, DeviceKind};
 
 /// Whether an endpoint plays audio or records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -49,6 +51,31 @@ pub fn enumerate() -> Result<Vec<WinAudioDevice>, AudioEnumError> {
 #[cfg(not(windows))]
 pub fn enumerate() -> Result<Vec<WinAudioDevice>, AudioEnumError> {
     Err(AudioEnumError::Unsupported)
+}
+
+/// The same endpoints as [`enumerate`], as the shared [`AudioDevice`] the routing model
+/// and the settings IPC both speak.
+///
+/// The mapping lives here rather than in each caller because it encodes decisions only
+/// this module can answer — that the opaque endpoint id is the identity a saved route
+/// stores and the friendly name is display only, and that a *render* endpoint is
+/// something you play to. Two copies of that are two chances to disagree about which
+/// field is which, and the disagreement would surface as saved routes that stop matching
+/// devices.
+pub fn enumerate_shared(device_id: DeviceId) -> Result<Vec<AudioDevice>, AudioEnumError> {
+    Ok(enumerate()?
+        .into_iter()
+        .map(|d| AudioDevice {
+            device_id,
+            node: d.id,
+            name: d.description,
+            kind: match d.kind {
+                EndpointKind::Render => DeviceKind::Output,
+                EndpointKind::Capture => DeviceKind::Input,
+            },
+            is_default: d.is_default,
+        })
+        .collect())
 }
 
 #[cfg(windows)]

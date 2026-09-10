@@ -21,19 +21,19 @@ use anyhow::Context;
 use ultidesk_identity::{Identity, PeerKey, PeerStore};
 use ultidesk_transport::{MessageStream, PeerConnection, PeerEndpoint, TrustPolicy};
 
-use crate::ipc::{Injector, IpcRequest, IpcResponse, Session};
+use crate::ipc::{IpcRequest, IpcResponse, LocalBackends, Session};
 
 /// Serve pinned peers until the process is stopped.
 ///
-/// The injector arrives as a trait object rather than a generic so that both this
-/// transport and the dev TCP one are handed the *same* chosen backend: which injector
-/// is in use decides whether the agent can run unattended, and picking it twice is two
-/// chances to pick differently.
+/// The backends arrive already chosen rather than being selected here, so that both
+/// this transport and the dev TCP one are handed the *same* injector: which one is in
+/// use decides whether the agent can run unattended, and picking it twice is two chances
+/// to pick differently.
 pub async fn serve(
     identity: &Identity,
     bind: SocketAddr,
     peers: &PeerStore,
-    injector: Arc<dyn Injector + Send + Sync>,
+    backends: Arc<LocalBackends>,
 ) -> anyhow::Result<()> {
     let trusted = peers.keys();
     // Refused up front rather than accepted-and-always-rejected. An agent that listens
@@ -71,11 +71,11 @@ pub async fn serve(
             // rather than unwrapped: a peer that authenticated must never be dropped
             // because its label is missing.
             .unwrap_or_else(|| conn.peer_key().fingerprint());
-        let injector = injector.clone();
+        let backends = backends.clone();
 
         tokio::spawn(async move {
             tracing::info!(peer = %name, addr = %conn.remote_address(), "peer connected");
-            if let Err(e) = serve_connection(&conn, injector).await {
+            if let Err(e) = serve_connection(&conn, backends).await {
                 tracing::warn!(peer = %name, error = %e, "peer connection ended with error");
             }
             tracing::info!(peer = %name, "peer disconnected");
@@ -92,22 +92,22 @@ pub async fn serve(
 /// peer's side, like a connection that accepted a stream and then went silent.
 async fn serve_connection(
     conn: &PeerConnection,
-    injector: Arc<dyn Injector + Send + Sync>,
+    backends: Arc<LocalBackends>,
 ) -> anyhow::Result<()> {
     let mut streams = tokio::task::JoinSet::new();
     while let Some(stream) = conn.accept_control().await {
         let mut stream = stream?;
-        let injector = injector.clone();
+        let backends = backends.clone();
         streams.spawn(async move {
             // One session per stream, so the held-input bookkeeping — and therefore the
             // release below — is scoped to exactly the stream that pressed the keys.
             let mut session = Session::for_authenticated_peer();
-            let result = pump(&mut stream, &mut session, injector.as_ref()).await;
+            let result = pump(&mut stream, &mut session, backends.as_ref()).await;
 
             // However the stream ended — cleanly, a crash, a pulled cable — anything it
             // was holding must be released, or a modifier stays down on this machine and
             // the operator is no longer looking at it.
-            let released = session.release_all(injector.as_ref());
+            let released = session.release_all(backends.injector.as_ref());
             if released > 0 {
                 tracing::info!(released, "released held input after the stream ended");
             }
@@ -127,11 +127,11 @@ async fn serve_connection(
 async fn pump(
     stream: &mut MessageStream,
     session: &mut Session,
-    injector: &(dyn Injector + Send + Sync),
+    backends: &LocalBackends,
 ) -> anyhow::Result<()> {
     while let Some(payload) = stream.recv().await? {
         let response = match serde_json::from_slice::<IpcRequest>(&payload) {
-            Ok(req) => session.handle(req, injector),
+            Ok(req) => session.handle(req, &backends.borrow()),
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),
@@ -275,4 +275,136 @@ pub async fn peer_ping(
         );
     }
     Ok(())
+}
+
+/// Ask a paired peer what audio endpoints it has.
+///
+/// # The answer is checked against the identity that was authenticated
+/// Every endpoint carries the `DeviceId` of the machine that owns it, and the peer fills
+/// that in itself. Nothing stops a compromised peer from labelling its endpoints with
+/// *another* machine's id — and if it did, a saved route would silently be re-pointed at
+/// a device on a third machine.
+///
+/// It cannot get away with it here, and only because the id is derived from the public
+/// key ([ADR-0012]): this end knows which key completed the handshake, so it can compute
+/// the id that key is entitled to and reject anything else. That check is the concrete
+/// payoff of deriving the id rather than drawing it at random — with a random uuid there
+/// would be nothing to compare against.
+///
+/// [ADR-0012]: ../../../docs/adrs/0012-device-identity.md
+pub async fn peer_audio_devices(
+    identity: &Identity,
+    peers: &PeerStore,
+    addr: SocketAddr,
+) -> anyhow::Result<Vec<ultidesk_topology::AudioDevice>> {
+    let trusted = peers.keys();
+    if trusted.is_empty() {
+        anyhow::bail!("no peers are paired; run `ultidesk-agent pair` first");
+    }
+
+    let endpoint =
+        PeerEndpoint::bind(identity, "0.0.0.0:0".parse()?, TrustPolicy::Pinned(trusted))?;
+    let conn = endpoint
+        .connect(addr)
+        .await
+        .with_context(|| format!("could not reach a paired peer at {addr}"))?;
+    let peer_key = conn.peer_key();
+    let name = peers
+        .get(&peer_key)
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| peer_key.fingerprint());
+
+    let mut stream = conn.open_control().await?;
+    stream
+        .send(&serde_json::to_vec(&IpcRequest::ListAudioDevices)?)
+        .await?;
+    let reply = stream
+        .recv()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("the peer closed the stream without replying"))?;
+    stream.finish().await?;
+    conn.close("done");
+
+    let devices = match serde_json::from_slice::<IpcResponse>(&reply)? {
+        IpcResponse::AudioDevices { devices } => devices,
+        IpcResponse::Error { code, message } => {
+            anyhow::bail!("{name} refused the request ({code}): {message}")
+        }
+        other => anyhow::bail!("{name} answered ListAudioDevices with {other:?}"),
+    };
+
+    check_owner(&devices, peer_key).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    Ok(devices)
+}
+
+/// Refuse a device list that claims to belong to a machine other than the one that
+/// proved its identity.
+fn check_owner(
+    devices: &[ultidesk_topology::AudioDevice],
+    peer_key: PeerKey,
+) -> Result<(), String> {
+    let expected = peer_key.device_id();
+    if let Some(bad) = devices.iter().find(|d| d.device_id != expected) {
+        return Err(format!(
+            "endpoint {:?} is labelled as belonging to device {}, but the peer that sent \
+             it authenticated as {} ({})",
+            bad.node,
+            bad.device_id,
+            expected,
+            peer_key.fingerprint()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultidesk_topology::{AudioDevice, DeviceKind};
+
+    fn device(device_id: ultidesk_core::DeviceId) -> AudioDevice {
+        AudioDevice {
+            device_id,
+            node: "speakers".into(),
+            name: "Speakers".into(),
+            kind: DeviceKind::Output,
+            is_default: true,
+        }
+    }
+
+    #[test]
+    fn a_peers_own_devices_are_accepted() {
+        let key = Identity::from_secret_bytes([4u8; 32]).public();
+        assert_eq!(check_owner(&[device(key.device_id())], key), Ok(()));
+    }
+
+    #[test]
+    fn an_empty_list_is_fine() {
+        // A machine really can have no endpoints, and that is not a spoofing attempt.
+        let key = Identity::from_secret_bytes([4u8; 32]).public();
+        assert_eq!(check_owner(&[], key), Ok(()));
+    }
+
+    #[test]
+    fn a_peer_cannot_label_its_devices_as_another_machines() {
+        // The whole point: with a random uuid there would be nothing to compare against,
+        // and a compromised peer could re-point a saved route at a third machine.
+        let peer = Identity::from_secret_bytes([4u8; 32]).public();
+        let someone_else = Identity::from_secret_bytes([5u8; 32]).public();
+
+        let err = check_owner(&[device(someone_else.device_id())], peer).unwrap_err();
+        assert!(err.contains(&peer.fingerprint()), "{err}");
+        assert!(err.contains("speakers"), "{err}");
+    }
+
+    #[test]
+    fn one_bad_entry_rejects_the_whole_list() {
+        // Not filtered: a list that is partly forged is not a list to act on, and
+        // silently dropping entries would leave the operator wondering where a device
+        // went.
+        let peer = Identity::from_secret_bytes([4u8; 32]).public();
+        let other = Identity::from_secret_bytes([6u8; 32]).public();
+        let list = [device(peer.device_id()), device(other.device_id())];
+        assert!(check_owner(&list, peer).is_err());
+    }
 }

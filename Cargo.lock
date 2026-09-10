@@ -5425,6 +5425,7 @@ dependencies = [
  "tracing",
  "ultidesk-core",
  "ultidesk-platform-windows",
+ "ultidesk-topology",
  "zbus 5.19.0",
 ]
 
@@ -5435,6 +5436,8 @@ dependencies = [
  "serde",
  "thiserror 2.0.19",
  "tracing",
+ "ultidesk-core",
+ "ultidesk-topology",
  "windows 0.58.0",
 ]
 

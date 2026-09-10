@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use ultidesk_core::protocol::PROTOCOL_VERSION;
 use ultidesk_platform_windows::inject::{InputError, MouseButton, VirtualScreen};
+use ultidesk_topology::AudioDevice;
 
 /// Requests the desktop app sends to the agent over local IPC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +45,9 @@ pub enum IpcRequest {
     },
     /// Release every key/button this session is currently holding. Idempotent.
     ReleaseAllInput,
+    /// This machine's audio endpoints. Read-only, and the first message of the settings
+    /// surface: the control app cannot show a peer's devices without asking for them.
+    ListAudioDevices,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +64,9 @@ pub enum IpcResponse {
     Injected,
     Released {
         count: usize,
+    },
+    AudioDevices {
+        devices: Vec<AudioDevice>,
     },
     Error {
         code: String,
@@ -124,6 +131,103 @@ pub trait Injector {
     fn key(&self, scancode: u16, down: bool) -> Result<(), InputError>;
     fn scroll(&self, delta_x: i32, delta_y: i32) -> Result<(), InputError>;
     fn enumerate(&self) -> Vec<WindowDto>;
+}
+
+/// What this machine can say about its own audio endpoints.
+///
+/// Separate from [`Injector`] rather than another method on it: injection is something a
+/// peer *does to* this machine and is gated accordingly, while this is something the
+/// machine *reports about itself*. Folding them together would mean a future permission
+/// check could not tell the two apart.
+pub trait AudioInventory {
+    /// The endpoints, or an operator-facing reason there are none.
+    ///
+    /// A `String` because every caller does the same thing with it — puts it in front of
+    /// a person — and the platform errors underneath are already unrelated types.
+    fn devices(&self) -> Result<Vec<AudioDevice>, String>;
+}
+
+/// The local capabilities a session may be asked about.
+///
+/// Bundled rather than passed one argument at a time because the settings surface is
+/// going to grow — monitors and topology next — and a dispatcher whose signature changes
+/// with every capability drags four transports and every test along with it.
+///
+/// The borrows carry no `Send`/`Sync` bound. They do not need one: a `Backends` is built
+/// inside the statement that dispatches and dropped at the end of it, so it never
+/// crosses an await and never leaves the task. [`LocalBackends`] carries the bounds
+/// instead, because that one really is shared between tasks. Requiring them here as well
+/// would only forbid the obvious `RefCell`-recording test double.
+pub struct Backends<'a> {
+    pub injector: &'a dyn Injector,
+    pub audio: &'a dyn AudioInventory,
+}
+
+/// Real audio enumeration, backed by whichever platform this build targets.
+///
+/// Carries the device id rather than reading it per call: every endpoint it returns is
+/// labelled with *this* machine's identity, and that label is what lets a receiver check
+/// the answer against the key it authenticated. Deriving it once at construction means
+/// a single session cannot report two different machines.
+pub struct RealAudioInventory {
+    device_id: ultidesk_core::DeviceId,
+}
+
+impl RealAudioInventory {
+    pub fn new(device_id: ultidesk_core::DeviceId) -> Self {
+        RealAudioInventory { device_id }
+    }
+}
+
+impl AudioInventory for RealAudioInventory {
+    fn devices(&self) -> Result<Vec<AudioDevice>, String> {
+        // Only the per-platform selection is here; the field mapping lives in the
+        // platform crate that owns the endpoint type, so the editor and the agent cannot
+        // disagree about what a saved route is keyed on.
+        #[cfg(target_os = "linux")]
+        {
+            ultidesk_platform_linux::audio_devices::enumerate_shared(self.device_id)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(windows)]
+        {
+            ultidesk_platform_windows::audio_devices::enumerate_shared(self.device_id)
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            Err("audio device enumeration is not implemented for this platform".into())
+        }
+    }
+}
+
+/// The backends a transport owns and lends to each connection.
+///
+/// `Backends` borrows; this owns. A transport serves many connections from one set of
+/// capabilities, and each connection is a spawned task, so the shared thing has to be
+/// `Arc`-held while the thing the dispatcher takes stays a cheap borrow.
+pub struct LocalBackends {
+    pub injector: std::sync::Arc<dyn Injector + Send + Sync>,
+    pub audio: std::sync::Arc<dyn AudioInventory + Send + Sync>,
+}
+
+impl LocalBackends {
+    pub fn new(
+        injector: std::sync::Arc<dyn Injector + Send + Sync>,
+        device_id: ultidesk_core::DeviceId,
+    ) -> Self {
+        LocalBackends {
+            injector,
+            audio: std::sync::Arc::new(RealAudioInventory::new(device_id)),
+        }
+    }
+
+    pub fn borrow(&self) -> Backends<'_> {
+        Backends {
+            injector: self.injector.as_ref(),
+            audio: self.audio.as_ref(),
+        }
+    }
 }
 
 /// Real injector backed by `ultidesk-platform-windows`.
@@ -220,7 +324,8 @@ impl Session {
 
     /// Handle one request. Any command other than `Hello` before successful
     /// authentication is rejected.
-    pub fn handle<I: Injector + ?Sized>(&mut self, req: IpcRequest, injector: &I) -> IpcResponse {
+    pub fn handle(&mut self, req: IpcRequest, backends: &Backends<'_>) -> IpcResponse {
+        let injector = backends.injector;
         if !self.authenticated {
             match req {
                 IpcRequest::Hello {
@@ -305,6 +410,13 @@ impl Session {
                 let count = self.release_all(injector);
                 IpcResponse::Released { count }
             }
+            // Deliberately answers about *this* machine only. A request to relay a
+            // peer's devices would be a different message, because the answer would
+            // then carry a device id this machine cannot vouch for.
+            IpcRequest::ListAudioDevices => match backends.audio.devices() {
+                Ok(devices) => IpcResponse::AudioDevices { devices },
+                Err(message) => err("audio_unavailable", &message),
+            },
         }
     }
 
@@ -359,6 +471,19 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
+    /// Answers whatever the test told it to, including a failure — the error path is
+    /// the one a machine with no working audio daemon actually takes.
+    struct MockAudio(Result<Vec<AudioDevice>, String>);
+    impl AudioInventory for MockAudio {
+        fn devices(&self) -> Result<Vec<AudioDevice>, String> {
+            self.0.clone()
+        }
+    }
+
+    fn backends<'a>(injector: &'a dyn Injector, audio: &'a dyn AudioInventory) -> Backends<'a> {
+        Backends { injector, audio }
+    }
+
     #[derive(Default)]
     struct MockInjector {
         events: RefCell<Vec<String>>,
@@ -395,25 +520,27 @@ mod tests {
 
     const TOKEN: &str = "s3cret-token";
 
-    fn authed() -> (Session, MockInjector) {
+    fn authed() -> (Session, MockInjector, MockAudio) {
         let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
         let r = s.handle(
             IpcRequest::Hello {
                 token: TOKEN.into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         assert!(matches!(r, IpcResponse::HelloOk { .. }));
-        (s, inj)
+        (s, inj, audio)
     }
 
     #[test]
     fn commands_before_hello_are_rejected() {
         let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
-        let r = s.handle(IpcRequest::Ping, &inj);
+        let audio = MockAudio(Ok(Vec::new()));
+        let r = s.handle(IpcRequest::Ping, &backends(&inj, &audio));
         assert!(matches!(r, IpcResponse::Error { .. }));
         assert!(!s.is_authenticated());
     }
@@ -424,9 +551,10 @@ mod tests {
         // first message may be a command.
         let mut s = Session::for_authenticated_peer();
         let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
         assert!(s.is_authenticated());
         assert!(matches!(
-            s.handle(IpcRequest::Ping, &inj),
+            s.handle(IpcRequest::Ping, &backends(&inj, &audio)),
             IpcResponse::Pong
         ));
     }
@@ -437,12 +565,13 @@ mod tests {
         // second, weaker way in beside the handshake.
         let mut s = Session::for_authenticated_peer();
         let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
         let r = s.handle(
             IpcRequest::Hello {
                 token: String::new(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         assert!(matches!(r, IpcResponse::Error { .. }), "{r:?}");
     }
@@ -451,12 +580,13 @@ mod tests {
     fn wrong_token_rejected() {
         let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
         let r = s.handle(
             IpcRequest::Hello {
                 token: "nope".into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         assert!(matches!(r, IpcResponse::Error { .. }));
         assert!(!s.is_authenticated());
@@ -466,36 +596,37 @@ mod tests {
     fn protocol_mismatch_rejected() {
         let mut s = Session::new(TOKEN);
         let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
         let r = s.handle(
             IpcRequest::Hello {
                 token: TOKEN.into(),
                 protocol_version: PROTOCOL_VERSION + 100,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         assert!(matches!(r, IpcResponse::Error { code, .. } if code == "protocol_mismatch"));
     }
 
     #[test]
     fn held_input_is_tracked_and_released() {
-        let (mut s, inj) = authed();
+        let (mut s, inj, audio) = authed();
         s.handle(
             IpcRequest::InjectMouseButton {
                 button: MouseButtonDto::Left,
                 down: true,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         s.handle(
             IpcRequest::InjectKey {
                 scancode: 0x1D,
                 down: true,
             },
-            &inj,
+            &backends(&inj, &audio),
         ); // Ctrl
         assert_eq!(s.held_count(), 2);
 
-        let r = s.handle(IpcRequest::ReleaseAllInput, &inj);
+        let r = s.handle(IpcRequest::ReleaseAllInput, &backends(&inj, &audio));
         assert!(matches!(r, IpcResponse::Released { count: 2 }));
         assert_eq!(s.held_count(), 0);
         // The mock recorded the key-up / button-up during release.
@@ -506,13 +637,13 @@ mod tests {
 
     #[test]
     fn matched_up_event_clears_held_without_release_all() {
-        let (mut s, inj) = authed();
+        let (mut s, inj, audio) = authed();
         s.handle(
             IpcRequest::InjectKey {
                 scancode: 0x1D,
                 down: true,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         assert_eq!(s.held_count(), 1);
         s.handle(
@@ -520,7 +651,7 @@ mod tests {
                 scancode: 0x1D,
                 down: false,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         assert_eq!(s.held_count(), 0);
     }
@@ -532,20 +663,21 @@ mod tests {
             fail_blocked: true,
             ..Default::default()
         };
+        let audio = MockAudio(Ok(Vec::new()));
         // authenticate
         s.handle(
             IpcRequest::Hello {
                 token: TOKEN.into(),
                 protocol_version: PROTOCOL_VERSION,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         let r = s.handle(
             IpcRequest::InjectMouseButton {
                 button: MouseButtonDto::Left,
                 down: true,
             },
-            &inj,
+            &backends(&inj, &audio),
         );
         assert!(matches!(r, IpcResponse::Error { code, .. } if code == "input_blocked"));
         assert_eq!(
@@ -553,6 +685,91 @@ mod tests {
             0,
             "a blocked press must not be tracked as held"
         );
+    }
+
+    fn a_device(device_id: ultidesk_core::DeviceId, node: &str) -> AudioDevice {
+        AudioDevice {
+            device_id,
+            node: node.to_string(),
+            name: format!("{node} (display name)"),
+            kind: ultidesk_topology::DeviceKind::Output,
+            is_default: false,
+        }
+    }
+
+    #[test]
+    fn listing_audio_devices_needs_authentication_like_everything_else() {
+        // The settings surface is read-only, which is not the same as public: what
+        // endpoints a machine has, and what they are called, is information about it.
+        let mut s = Session::new(TOKEN);
+        let inj = MockInjector::default();
+        let id = ultidesk_core::DeviceId::new();
+        let audio = MockAudio(Ok(vec![a_device(id, "speakers")]));
+
+        let r = s.handle(IpcRequest::ListAudioDevices, &backends(&inj, &audio));
+        assert!(matches!(r, IpcResponse::Error { code, .. } if code == "unauthenticated"));
+    }
+
+    #[test]
+    fn an_authenticated_session_gets_the_devices() {
+        let (mut s, inj, _) = authed();
+        let id = ultidesk_core::DeviceId::new();
+        let audio = MockAudio(Ok(vec![a_device(id, "speakers"), a_device(id, "headset")]));
+
+        match s.handle(IpcRequest::ListAudioDevices, &backends(&inj, &audio)) {
+            IpcResponse::AudioDevices { devices } => {
+                assert_eq!(devices.len(), 2);
+                assert_eq!(devices[0].node, "speakers");
+                assert!(
+                    devices.iter().all(|d| d.device_id == id),
+                    "every endpoint must be labelled with the machine that owns it"
+                );
+            }
+            other => panic!("expected AudioDevices, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_machine_that_cannot_read_its_audio_says_so_rather_than_reporting_none() {
+        // An empty list and a broken audio daemon are different answers, and an operator
+        // debugging silence needs to be able to tell them apart.
+        let (mut s, inj, _) = authed();
+        let audio = MockAudio(Err("could not reach the PipeWire daemon".into()));
+
+        match s.handle(IpcRequest::ListAudioDevices, &backends(&inj, &audio)) {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "audio_unavailable");
+                assert!(message.contains("PipeWire"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_endpoints_is_not_an_error() {
+        let (mut s, inj, _) = authed();
+        let audio = MockAudio(Ok(Vec::new()));
+        assert!(matches!(
+            s.handle(IpcRequest::ListAudioDevices, &backends(&inj, &audio)),
+            IpcResponse::AudioDevices { devices } if devices.is_empty()
+        ));
+    }
+
+    #[test]
+    fn listing_devices_holds_no_input_and_releases_nothing() {
+        // A read-only request must not disturb the held-input bookkeeping that a
+        // disconnect depends on.
+        let (mut s, inj, _) = authed();
+        let audio = MockAudio(Ok(Vec::new()));
+        s.handle(
+            IpcRequest::InjectKey {
+                scancode: 0x1D,
+                down: true,
+            },
+            &backends(&inj, &audio),
+        );
+        s.handle(IpcRequest::ListAudioDevices, &backends(&inj, &audio));
+        assert_eq!(s.held_count(), 1, "the held key must survive a query");
     }
 
     #[test]

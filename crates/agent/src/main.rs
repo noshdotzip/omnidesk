@@ -21,6 +21,8 @@
 //!                              (ADR-0002). No token: a peer is admitted by its key.
 //!   ultidesk-agent peer-ping   Round-trip a Ping against a paired peer and report the
 //!                              latency of the real path. Injects nothing.
+//!   ultidesk-agent peer-devices Print a paired peer's audio endpoints as JSON, refusing
+//!                              any the peer labels as another machine's.
 //!   ultidesk-agent uinput-test Move the pointer through a square using virtual
 //!                              input devices. Linux only. Raises NO permission
 //!                              dialog and DOES move the real cursor.
@@ -70,6 +72,7 @@ fn main() -> Result<()> {
         "serve-peer-dev" => serve_peer_dev(),
         "serve-peer" => serve_peer(),
         "peer-ping" => peer_ping(),
+        "peer-devices" => peer_devices(),
         "pair" => pair(),
         "peers" => peers(),
         "kvm-demo" => kvm_demo(),
@@ -85,7 +88,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -485,8 +488,12 @@ fn serve_peer_dev() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let injector = choose_injector()?;
-    rt.block_on(tcp::serve(bind, token, injector))
+    let (_dir, identity) = local_identity()?;
+    let backends = std::sync::Arc::new(ipc::LocalBackends::new(
+        choose_injector()?,
+        identity.device_id(),
+    ));
+    rt.block_on(tcp::serve(bind, token, backends))
 }
 
 /// Serve paired peers over the authenticated QUIC channel (ADR-0002).
@@ -515,8 +522,11 @@ fn serve_peer() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let injector = choose_injector()?;
-    rt.block_on(quic::serve(&identity, bind, &loaded.store, injector))
+    let backends = std::sync::Arc::new(ipc::LocalBackends::new(
+        choose_injector()?,
+        identity.device_id(),
+    ));
+    rt.block_on(quic::serve(&identity, bind, &loaded.store, backends))
 }
 
 /// Round-trip a Ping against a paired peer, and report the latency of the real path.
@@ -543,6 +553,29 @@ fn peer_ping() -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(quic::peer_ping(&identity, &loaded.store, addr, count))
+}
+
+/// Ask a paired peer for its audio endpoints — the first settings-IPC message.
+fn peer_devices() -> Result<()> {
+    let addr: std::net::SocketAddr = std::env::args()
+        .nth(2)
+        .ok_or_else(|| anyhow::anyhow!("usage: ultidesk-agent peer-devices <host:port>"))?
+        .parse()
+        .context("the peer address must be host:port")?;
+
+    let (dir, identity) = local_identity()?;
+    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
+    if let Some(note) = &loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let devices = rt.block_on(quic::peer_audio_devices(&identity, &loaded.store, addr))?;
+    println!("{}", serde_json::to_string_pretty(&devices)?);
+    tracing::info!(count = devices.len(), "read a peer's audio endpoints");
+    Ok(())
 }
 
 /// Pair with another machine: establish a channel, compare a code, pin the key.
@@ -1067,30 +1100,16 @@ fn uinput_test() -> Result<()> {
 /// PipeWire registry and the WASAPI endpoint enumeration — so this is also where a
 /// divergence between them would show up first.
 fn audio_devices() -> Result<()> {
-    println!("{}", local_audio_devices_json()?);
+    // The same call the IPC answers with, so the subcommand and the message can never
+    // disagree about what this machine has.
+    use ipc::AudioInventory;
+    let (_dir, identity) = local_identity()?;
+    let devices = ipc::RealAudioInventory::new(identity.device_id())
+        .devices()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    tracing::info!(count = devices.len(), "enumerated audio endpoints");
+    println!("{}", serde_json::to_string_pretty(&devices)?);
     Ok(())
-}
-
-// One function per platform rather than `cfg` blocks inside one body: the blocks each
-// need their own tail, which reads as an unconditional early return on whichever
-// platform is being compiled.
-#[cfg(target_os = "linux")]
-fn local_audio_devices_json() -> Result<String> {
-    let devices = ultidesk_platform_linux::audio_devices::enumerate()?;
-    tracing::info!(count = devices.len(), "enumerated PipeWire audio endpoints");
-    Ok(serde_json::to_string_pretty(&devices)?)
-}
-
-#[cfg(windows)]
-fn local_audio_devices_json() -> Result<String> {
-    let devices = ultidesk_platform_windows::audio_devices::enumerate()?;
-    tracing::info!(count = devices.len(), "enumerated WASAPI audio endpoints");
-    Ok(serde_json::to_string_pretty(&devices)?)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn local_audio_devices_json() -> Result<String> {
-    anyhow::bail!("audio device enumeration is not implemented for this platform")
 }
 
 /// Stream this machine's audio output to a peer (Linux/PipeWire source side).
@@ -1140,6 +1159,13 @@ fn audio_recv() -> Result<()> {
 fn serve() -> Result<()> {
     use std::sync::Arc;
     let ep = endpoint::Endpoint::generate();
+    let (_dir, identity) = local_identity()?;
+    // Every endpoint this agent reports is labelled with the machine's derived id, so a
+    // client can check the answer against the identity it authenticated.
+    let backends = Arc::new(ipc::LocalBackends::new(
+        Arc::new(ipc::RealInjector),
+        identity.device_id(),
+    ));
     let path = endpoint::write_handshake(&ep)?;
     // The pipe name is fine to log; the token is NOT logged.
     tracing::info!(pipe = %ep.endpoint_path, handshake = %path.display(), "agent IPC listening");
@@ -1149,14 +1175,9 @@ fn serve() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(async move {
-        pipe::serve(
-            ep.endpoint_path.clone(),
-            ep.token.clone(),
-            Arc::new(ipc::RealInjector),
-        )
-        .await
-    })
+    rt.block_on(
+        async move { pipe::serve(ep.endpoint_path.clone(), ep.token.clone(), backends).await },
+    )
 }
 
 /// Run the local IPC server on Unix, over a socket in the session's runtime directory.
@@ -1171,6 +1192,13 @@ fn serve() -> Result<()> {
 fn serve() -> Result<()> {
     use std::sync::Arc;
     let ep = endpoint::Endpoint::generate();
+    let (_dir, identity) = local_identity()?;
+    // Every endpoint this agent reports is labelled with the machine's derived id, so a
+    // client can check the answer against the identity it authenticated.
+    let backends = Arc::new(ipc::LocalBackends::new(
+        Arc::new(ipc::RealInjector),
+        identity.device_id(),
+    ));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1190,7 +1218,7 @@ fn serve() -> Result<()> {
         );
         println!("{}", path.display());
 
-        unix_socket::serve(listener, ep.token.clone(), Arc::new(ipc::RealInjector)).await
+        unix_socket::serve(listener, ep.token.clone(), backends).await
     })
 }
 

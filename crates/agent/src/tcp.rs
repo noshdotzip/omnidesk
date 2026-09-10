@@ -16,7 +16,7 @@
 //! explicit subcommand that prints a warning, never the default. It must be deleted or
 //! replaced when the real control channel lands — not quietly promoted.
 
-use crate::ipc::{Injector, IpcRequest, IpcResponse, Session};
+use crate::ipc::{IpcRequest, IpcResponse, LocalBackends, Session};
 use anyhow::Context;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -27,7 +27,7 @@ use ultidesk_core::protocol::MAX_MESSAGE_BYTES;
 pub async fn serve(
     bind: String,
     token: String,
-    injector: Arc<dyn Injector + Send + Sync>,
+    backends: Arc<LocalBackends>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&bind)
         .await
@@ -42,10 +42,10 @@ pub async fn serve(
             tracing::warn!(error = %e, "could not disable Nagle on peer socket");
         }
         let token = token.clone();
-        let injector = injector.clone();
+        let backends = backends.clone();
         tokio::spawn(async move {
             tracing::info!(peer = %peer, "peer connected");
-            if let Err(e) = handle_connection(stream, &token, injector.as_ref()).await {
+            if let Err(e) = handle_connection(stream, &token, backends.as_ref()).await {
                 tracing::warn!(error = %e, "peer connection ended with error");
             }
             tracing::info!(peer = %peer, "peer disconnected");
@@ -56,7 +56,7 @@ pub async fn serve(
 async fn handle_connection(
     stream: TcpStream,
     token: &str,
-    injector: &(dyn Injector + Send + Sync),
+    backends: &LocalBackends,
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
@@ -88,7 +88,7 @@ async fn handle_connection(
             continue;
         }
         let response = match serde_json::from_str::<IpcRequest>(trimmed) {
-            Ok(req) => session.handle(req, injector),
+            Ok(req) => session.handle(req, &backends.borrow()),
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),
@@ -101,7 +101,7 @@ async fn handle_connection(
 
     // However the peer went away — clean disconnect, crash, or cable pull — anything it
     // was holding must be released, or a modifier stays stuck on this machine.
-    let released = session.release_all(injector);
+    let released = session.release_all(backends.injector.as_ref());
     if released > 0 {
         tracing::info!(released, "released held input after peer disconnect");
     }

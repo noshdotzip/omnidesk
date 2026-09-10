@@ -7,6 +7,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
+ultidesk-core = { workspace = true }
+# For the shared `AudioDevice` shape the routing model and the settings IPC speak. The
+# mapping from this platform's own DTO belongs beside the DTO, not in every caller.
+ultidesk-topology = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

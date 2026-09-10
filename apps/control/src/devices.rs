@@ -9,7 +9,7 @@
 //! reflects reality.
 
 use ultidesk_core::DeviceId;
-use ultidesk_topology::{AudioDevice, DeviceKind};
+use ultidesk_topology::AudioDevice;
 
 /// One machine's audio endpoints, plus whether they were actually read from hardware.
 pub struct MachineAudio {
@@ -61,42 +61,18 @@ pub fn remote_placeholder(device_id: DeviceId, label: &str) -> MachineAudio {
     }
 }
 
+// The mapping from each platform's own endpoint DTO to `AudioDevice` lives in the
+// platform crate that owns the DTO. This is only the per-platform selection, and the
+// agent makes the same call for the settings IPC — so what a saved route is keyed on
+// cannot drift between the editor and the agent that honours it.
 #[cfg(target_os = "linux")]
 fn enumerate_local(device_id: DeviceId) -> Result<Vec<AudioDevice>, String> {
-    use ultidesk_platform_linux::audio_devices::{enumerate, PwKind};
-    let found = enumerate().map_err(|e| e.to_string())?;
-    Ok(found
-        .into_iter()
-        .map(|d| AudioDevice {
-            device_id,
-            node: d.node,
-            name: d.description,
-            kind: match d.kind {
-                PwKind::Sink => DeviceKind::Output,
-                PwKind::Source => DeviceKind::Input,
-            },
-            is_default: d.is_default,
-        })
-        .collect())
+    ultidesk_platform_linux::audio_devices::enumerate_shared(device_id).map_err(|e| e.to_string())
 }
 
 #[cfg(windows)]
 fn enumerate_local(device_id: DeviceId) -> Result<Vec<AudioDevice>, String> {
-    use ultidesk_platform_windows::audio_devices::{enumerate, EndpointKind};
-    let found = enumerate().map_err(|e| e.to_string())?;
-    Ok(found
-        .into_iter()
-        .map(|d| AudioDevice {
-            device_id,
-            node: d.id,
-            name: d.description,
-            kind: match d.kind {
-                EndpointKind::Render => DeviceKind::Output,
-                EndpointKind::Capture => DeviceKind::Input,
-            },
-            is_default: d.is_default,
-        })
-        .collect())
+    ultidesk_platform_windows::audio_devices::enumerate_shared(device_id).map_err(|e| e.to_string())
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
