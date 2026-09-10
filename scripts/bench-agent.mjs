@@ -120,7 +120,7 @@ async function main() {
   });
 
   const ep = JSON.parse(readFileSync(handshakePath, "utf8"));
-  const socket = await connect(ep.pipe_name);
+  const socket = await connect(ep.endpoint_path);
   const client = new PipeClient(socket);
 
   const hello = await client.request({

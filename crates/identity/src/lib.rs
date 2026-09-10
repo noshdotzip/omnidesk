@@ -22,7 +22,11 @@
 //! only original construction is the domain-separated derivation of the device id, the
 //! fingerprint and the pairing code, each of which is pinned by a test.
 
-mod file;
+/// Small-state-file handling: atomic replacement, and `0600` for files holding a
+/// secret. Public because the agent's handshake file has the same two needs — it carries
+/// the local IPC token — and a second copy of the rule is a second chance to get the
+/// mode wrong.
+pub mod file;
 mod hex;
 pub mod key;
 pub mod peers;

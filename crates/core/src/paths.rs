@@ -1,4 +1,5 @@
-//! Where Ultidesk keeps per-user configuration, as one rule shared by every process.
+//! Where Ultidesk keeps per-user configuration and per-session runtime state, as one
+//! rule shared by every process.
 //!
 //! The control app and the agent must resolve the *same* directory or they disagree
 //! about which machine this is: the control app would edit one `settings.json` while
@@ -71,6 +72,78 @@ pub fn resolve_config_dir(env: &ConfigEnv, windows: bool) -> Option<PathBuf> {
         .map(|h| h.join(".config").join("ultidesk"))
 }
 
+/// The environment [`runtime_dir`] reads.
+#[derive(Debug, Default, Clone)]
+pub struct RuntimeEnv {
+    pub override_dir: Option<PathBuf>,
+    /// `LOCALAPPDATA` on Windows — machine-local rather than roaming, because a socket
+    /// path or a pid means nothing on another machine.
+    pub local_appdata: Option<PathBuf>,
+    /// `XDG_RUNTIME_DIR` on Linux.
+    pub xdg_runtime_dir: Option<PathBuf>,
+    pub temp_dir: PathBuf,
+    /// Only used to name the fallback directory, so two users on one machine do not
+    /// collide in a shared `/tmp`.
+    pub user: Option<String>,
+}
+
+impl RuntimeEnv {
+    pub fn from_process() -> Self {
+        let var = |k: &str| std::env::var_os(k).map(PathBuf::from);
+        RuntimeEnv {
+            override_dir: var("ULTIDESK_DEV_DIR"),
+            local_appdata: var("LOCALAPPDATA"),
+            xdg_runtime_dir: var("XDG_RUNTIME_DIR"),
+            temp_dir: std::env::temp_dir(),
+            user: std::env::var("USER")
+                .ok()
+                .or_else(|| std::env::var("USERNAME").ok()),
+        }
+    }
+}
+
+/// Where this session's runtime state lives — the IPC socket and the handshake file.
+///
+/// Distinct from [`config_dir`] on purpose. Configuration outlives a login; a socket
+/// path and a pid do not, and leaving either behind after logout is how a client ends up
+/// connecting to nothing and reporting it as a mysterious failure.
+pub fn runtime_dir() -> PathBuf {
+    resolve_runtime_dir(&RuntimeEnv::from_process(), cfg!(windows))
+}
+
+/// The platform rules, as pure logic. `windows` is passed rather than read from `cfg!`
+/// so both branches are exercised from either host.
+///
+/// # Why `XDG_RUNTIME_DIR` is the answer on Linux, and not merely a convention
+/// `pam_systemd` creates it mode `0700`, owned by the user, and removes it at logout.
+/// That directory permission is a real access control, enforced by the kernel on every
+/// `connect()` — which is *stronger* than what the Windows named pipe has today, where
+/// the per-launch token is the only gate and ACL restriction is still tracked debt in
+/// docs/threat-model.md. Putting the socket anywhere world-traversable would throw that
+/// away and leave the token doing all the work again.
+///
+/// The fallback matters for exactly that reason: when `XDG_RUNTIME_DIR` is unset the
+/// directory under the temp dir has to be created `0700` by the caller, because `/tmp`
+/// is world-writable and a socket sitting in it is reachable by every user on the box.
+pub fn resolve_runtime_dir(env: &RuntimeEnv, windows: bool) -> PathBuf {
+    if let Some(dir) = &env.override_dir {
+        return dir.clone();
+    }
+    if windows {
+        return match &env.local_appdata {
+            Some(local) => local.join("Ultidesk"),
+            None => env.temp_dir.join("Ultidesk"),
+        };
+    }
+    if let Some(runtime) = &env.xdg_runtime_dir {
+        return runtime.join("ultidesk");
+    }
+    // Named per user: `/tmp` is shared, and two people logged into one machine must not
+    // land on the same path and fight over it.
+    let user = env.user.as_deref().unwrap_or("user");
+    env.temp_dir.join(format!("ultidesk-{user}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +159,81 @@ mod tests {
             appdata: appdata.map(PathBuf::from),
             xdg_config_home: xdg.map(PathBuf::from),
             home: home.map(PathBuf::from),
+        }
+    }
+
+    fn runtime_env(
+        override_dir: Option<&str>,
+        local_appdata: Option<&str>,
+        xdg_runtime: Option<&str>,
+        user: Option<&str>,
+    ) -> RuntimeEnv {
+        RuntimeEnv {
+            override_dir: override_dir.map(PathBuf::from),
+            local_appdata: local_appdata.map(PathBuf::from),
+            xdg_runtime_dir: xdg_runtime.map(PathBuf::from),
+            temp_dir: PathBuf::from("/tmp"),
+            user: user.map(String::from),
+        }
+    }
+
+    #[test]
+    fn the_runtime_override_wins_on_both_platforms() {
+        for windows in [true, false] {
+            let e = runtime_env(
+                Some("/dev-dir"),
+                Some("C:/Local"),
+                Some("/run/user/1000"),
+                None,
+            );
+            assert_eq!(resolve_runtime_dir(&e, windows), PathBuf::from("/dev-dir"));
+        }
+    }
+
+    #[test]
+    fn windows_runtime_state_is_machine_local_not_roaming() {
+        // LOCALAPPDATA rather than APPDATA: a socket path and a pid are meaningless on
+        // whatever other machine a roaming profile follows the user to.
+        let e = runtime_env(None, Some("C:/Users/n/AppData/Local"), None, None);
+        assert_eq!(
+            resolve_runtime_dir(&e, true),
+            PathBuf::from("C:/Users/n/AppData/Local").join("Ultidesk")
+        );
+    }
+
+    #[test]
+    fn linux_uses_the_xdg_runtime_dir() {
+        let e = runtime_env(None, None, Some("/run/user/1000"), Some("nosh"));
+        assert_eq!(
+            resolve_runtime_dir(&e, false),
+            PathBuf::from("/run/user/1000/ultidesk")
+        );
+    }
+
+    #[test]
+    fn the_linux_fallback_is_named_per_user() {
+        // `/tmp` is shared. Two people logged into one machine must not resolve to the
+        // same path and fight over the socket in it.
+        let a = runtime_env(None, None, None, Some("alice"));
+        let b = runtime_env(None, None, None, Some("bob"));
+        assert_eq!(
+            resolve_runtime_dir(&a, false),
+            PathBuf::from("/tmp/ultidesk-alice")
+        );
+        assert_ne!(
+            resolve_runtime_dir(&a, false),
+            resolve_runtime_dir(&b, false)
+        );
+    }
+
+    #[test]
+    fn a_runtime_dir_is_always_produced() {
+        // Unlike the config directory, there is no "nowhere to put it" answer: the agent
+        // cannot serve IPC at all without a socket path, so the temp fallback is the
+        // last resort rather than a `None` the caller has to handle.
+        for windows in [true, false] {
+            let e = runtime_env(None, None, None, None);
+            assert!(resolve_runtime_dir(&e, windows).is_absolute() || cfg!(windows));
         }
     }
 

@@ -1,39 +1,48 @@
 //! The IPC endpoint descriptor and its on-disk handshake file.
 //!
-//! At startup the agent generates a random pipe name and a per-launch auth token, then
-//! writes them to a handshake file that only the launching desktop app is expected to
-//! read. The desktop app reads the file, connects to the pipe, and presents the token.
+//! At startup the agent picks a listening address and generates a per-launch auth token,
+//! then writes both to a handshake file that only the launching desktop app is expected
+//! to read. The app reads the file, connects, and presents the token.
 //!
-//! Security note (tracked in docs/threat-model.md): the token gates the pipe, but the
-//! handshake file and pipe should *also* be ACL-restricted to the current user. That
-//! OS-level hardening is a follow-up; today the token is the enforced control and the
-//! handshake file is written under a per-user directory.
-
-// Transport-gated, not dead: the only IPC transport that exists today is the Windows
-// named pipe (`#[cfg(windows)] mod pipe`), so on other platforms nothing constructs
-// this module's types and every item reads as dead code under `-D warnings`. The
-// logic is deliberately platform-independent and stays compiled and unit-tested
-// everywhere, ready for the Linux transport (Milestone 9, docs/status.md).
-#![cfg_attr(not(windows), allow(dead_code))]
+//! # One field, two transports
+//! The address is a named-pipe path on Windows and a Unix-socket path on Linux. It is
+//! **one** field rather than two because a client opens both the same way — `net.connect(path)`
+//! in Node, `UnixStream`/`NamedPipeClient` in Rust — so a second field would only be a
+//! discriminant that nothing needs to branch on. The field was called `pipe_name` while
+//! the pipe was the only transport; renaming it is a breaking change to this file's
+//! shape, and the desktop client and the bench script were updated with it.
+//!
+//! # The file holds a secret
+//! The token is in it, so on Unix it is written `0600`, in a directory the platform
+//! already restricts (`XDG_RUNTIME_DIR`, mode `0700`). On Windows the equivalent ACL
+//! hardening is still outstanding and tracked in docs/threat-model.md — the token is the
+//! enforced control there, and this file being under `LOCALAPPDATA` is not the same
+//! protection.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use ultidesk_identity::file::{write_atomic, Visibility};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Endpoint {
-    pub pipe_name: String,
+    /// Where to connect: a named-pipe path on Windows, a Unix-socket path on Linux.
+    pub endpoint_path: String,
     pub token: String,
     pub protocol_version: u32,
     pub pid: u32,
 }
 
 impl Endpoint {
+    /// The descriptor for this launch.
+    ///
+    /// On Windows the pipe name carries a random suffix, because the pipe namespace is
+    /// machine-global and a fixed name can be squatted by another process. On Unix the
+    /// socket lives in a per-user directory the kernel already guards, so a fixed name
+    /// is what lets a client find the agent without being told where it is.
     pub fn generate() -> Self {
-        let id = Uuid::new_v4().simple().to_string();
         Endpoint {
-            // Local RPC pipe namespace. The random suffix avoids collisions/squatting.
-            pipe_name: format!(r"\\.\pipe\ultidesk-agent-{id}"),
+            endpoint_path: default_endpoint_path(),
             token: Uuid::new_v4().simple().to_string(),
             protocol_version: ultidesk_core::protocol::PROTOCOL_VERSION,
             pid: std::process::id(),
@@ -41,16 +50,31 @@ impl Endpoint {
     }
 }
 
-/// Per-user directory for Ultidesk runtime state. Uses `LOCALAPPDATA` on Windows and
-/// falls back to a dev directory so `cargo run` works from a checkout.
+#[cfg(windows)]
+fn default_endpoint_path() -> String {
+    let id = Uuid::new_v4().simple().to_string();
+    format!(r"\\.\pipe\ultidesk-agent-{id}")
+}
+
+#[cfg(unix)]
+fn default_endpoint_path() -> String {
+    socket_path().to_string_lossy().into_owned()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn default_endpoint_path() -> String {
+    String::new()
+}
+
+/// Per-user, per-session directory for runtime state. See `ultidesk_core::paths`.
 pub fn runtime_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("ULTIDESK_DEV_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        return PathBuf::from(local).join("Ultidesk");
-    }
-    std::env::temp_dir().join("Ultidesk")
+    ultidesk_core::paths::runtime_dir()
+}
+
+/// The Unix socket the agent listens on.
+#[cfg(unix)]
+pub fn socket_path() -> PathBuf {
+    runtime_dir().join("agent.sock")
 }
 
 pub fn handshake_path() -> PathBuf {
@@ -58,10 +82,63 @@ pub fn handshake_path() -> PathBuf {
 }
 
 pub fn write_handshake(ep: &Endpoint) -> std::io::Result<PathBuf> {
-    let dir = runtime_dir();
-    std::fs::create_dir_all(&dir)?;
     let path = handshake_path();
     let json = serde_json::to_string_pretty(ep)?;
-    std::fs::write(&path, json)?;
+    // Private, because the token is in it.
+    write_atomic(&path, json.as_bytes(), Visibility::Private)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_launch_gets_a_distinct_token() {
+        // The token is the local IPC's only authentication. Two launches sharing one
+        // would mean a client that captured it once could talk to a later agent.
+        let a = Endpoint::generate();
+        let b = Endpoint::generate();
+        assert_ne!(a.token, b.token);
+        assert_eq!(a.token.len(), 32, "a uuid's simple form");
+    }
+
+    #[test]
+    fn the_endpoint_path_is_not_empty_on_a_supported_platform() {
+        let ep = Endpoint::generate();
+        assert!(!ep.endpoint_path.is_empty());
+        assert_eq!(
+            ep.protocol_version,
+            ultidesk_core::protocol::PROTOCOL_VERSION
+        );
+        assert_eq!(ep.pid, std::process::id());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_pipe_name_is_unique_per_launch() {
+        // The pipe namespace is machine-global, so a fixed name can be squatted.
+        assert_ne!(
+            Endpoint::generate().endpoint_path,
+            Endpoint::generate().endpoint_path
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_path_is_stable_so_a_client_can_find_it() {
+        // The opposite choice from Windows, and deliberate: the directory is already
+        // per-user and mode 0700, so the path does not need to be unguessable — it needs
+        // to be findable without being told.
+        assert_eq!(
+            Endpoint::generate().endpoint_path,
+            Endpoint::generate().endpoint_path
+        );
+        assert!(Endpoint::generate().endpoint_path.ends_with("agent.sock"));
+    }
+
+    #[test]
+    fn the_handshake_lives_beside_the_socket() {
+        assert_eq!(handshake_path().parent(), Some(runtime_dir().as_path()));
+    }
 }

@@ -49,6 +49,8 @@ mod quic;
 mod tcp;
 #[cfg(target_os = "linux")]
 mod uinput_injector;
+#[cfg(unix)]
+mod unix_socket;
 
 use anyhow::{Context, Result};
 use ipc::Injector;
@@ -1140,7 +1142,7 @@ fn serve() -> Result<()> {
     let ep = endpoint::Endpoint::generate();
     let path = endpoint::write_handshake(&ep)?;
     // The pipe name is fine to log; the token is NOT logged.
-    tracing::info!(pipe = %ep.pipe_name, handshake = %path.display(), "agent IPC listening");
+    tracing::info!(pipe = %ep.endpoint_path, handshake = %path.display(), "agent IPC listening");
     // Also print the handshake path to stdout so a launching parent can find it.
     println!("{}", path.display());
 
@@ -1149,7 +1151,7 @@ fn serve() -> Result<()> {
         .build()?;
     rt.block_on(async move {
         pipe::serve(
-            ep.pipe_name.clone(),
+            ep.endpoint_path.clone(),
             ep.token.clone(),
             Arc::new(ipc::RealInjector),
         )
@@ -1157,9 +1159,37 @@ fn serve() -> Result<()> {
     })
 }
 
-#[cfg(not(windows))]
+/// Run the local IPC server on Unix, over a socket in the session's runtime directory.
+///
+/// The injector is `RealInjector`, which on Linux reports every injection as
+/// unsupported. That is deliberate rather than an oversight: this surface exists for the
+/// control app to *ask* the agent things — its monitors, its audio devices, its topology
+/// — and opening `/dev/uinput` to create a pair of virtual input devices just to answer
+/// a question would be a side effect nobody asked for. Injection on Linux is the peer
+/// path's job (`serve-peer`), which picks uinput because it is about to be driven.
+#[cfg(unix)]
 fn serve() -> Result<()> {
-    anyhow::bail!(
-        "the IPC server transport is currently Windows-only; use `enumerate` on this platform"
-    )
+    use std::sync::Arc;
+    let ep = endpoint::Endpoint::generate();
+    let listener = unix_socket::bind(std::path::Path::new(&ep.endpoint_path))?;
+
+    // Written only once the socket is bound. A handshake file naming a socket that does
+    // not exist sends the client to a dead path and the failure looks like the agent
+    // crashed rather than never having started.
+    let path = endpoint::write_handshake(&ep)?;
+    // The socket path is fine to log; the token is NOT logged.
+    tracing::info!(socket = %ep.endpoint_path, handshake = %path.display(), "agent IPC listening");
+    println!("{}", path.display());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        unix_socket::serve(listener, ep.token.clone(), Arc::new(ipc::RealInjector)).await
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn serve() -> Result<()> {
+    anyhow::bail!("no local IPC transport exists for this platform")
 }

@@ -25,6 +25,6 @@ pub mod scroll;
 
 pub use error::{CoreError, Result};
 pub use ids::{DeviceId, EventId, LeaseId, ProjectionId, SessionId};
-pub use paths::{config_dir, resolve_config_dir, ConfigEnv};
+pub use paths::{config_dir, resolve_config_dir, runtime_dir, ConfigEnv, RuntimeEnv};
 pub use projection::{ProjectionEvent, ProjectionState, ProjectionStateMachine, TransitionError};
 pub use scroll::{ScrollAccumulator, WheelDelta, PIXELS_PER_NOTCH, WHEEL_DELTA};
