@@ -7,6 +7,7 @@
 
 pub mod arrange;
 pub mod audio;
+pub mod crossing;
 pub mod layout;
 pub mod mapping;
 pub mod monitor;
@@ -15,6 +16,7 @@ pub mod saved;
 
 pub use arrange::{left_to_right, MachineMonitors};
 pub use audio::{AudioDevice, AudioRouting, DeviceKey, DeviceKind, Route, RouteError};
+pub use crossing::{crossing, edge_pressed, landing, landing_point, Crossing};
 pub use layout::{Adjacency, Layout, Rect, Side, DEFAULT_SNAP};
 pub use mapping::{
     letterbox_content_rect, map_edge_crossing, map_proxy_to_source, Edge, NormPoint, Point, Size,
