@@ -293,6 +293,7 @@ mod tests {
         let d = TempDir::new("roundtrip");
         let mut s = Settings::fresh();
         s.layout.monitors.push(ultidesk_topology::SavedMonitor {
+            device_id: Some(s.local_device_id),
             name: "DISPLAY1".into(),
             x: 100.0,
             y: 200.0,

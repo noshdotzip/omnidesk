@@ -5,6 +5,7 @@
 //! sources of "clicks land in the wrong place" bugs, so it lives in one audited place
 //! rather than being re-derived in the renderer and the agent.
 
+pub mod arrange;
 pub mod audio;
 pub mod layout;
 pub mod mapping;
@@ -12,6 +13,7 @@ pub mod monitor;
 pub mod remote_pointer;
 pub mod saved;
 
+pub use arrange::{left_to_right, MachineMonitors};
 pub use audio::{AudioDevice, AudioRouting, DeviceKey, DeviceKind, Route, RouteError};
 pub use layout::{Adjacency, Layout, Rect, Side, DEFAULT_SNAP};
 pub use mapping::{

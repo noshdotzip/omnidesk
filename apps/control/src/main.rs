@@ -303,18 +303,24 @@ fn Displays() -> Element {
             // and, because the names differ, makes it obvious these are not real.
             return demo_layout(&machines);
         }
-        // Placed to the right of everything local, which is the arrangement the
-        // barrier code already assumes. The operator drags it where it belongs.
-        let right = found
-            .iter()
-            .map(|m| m.right())
-            .fold(f64::NEG_INFINITY, f64::max);
-        let mut peer = peer_placeholder(machines.remote);
-        peer.logical_x = right;
-        found.push(peer);
+        // The starting arrangement: machines in a strip, left to right, in the order
+        // they connected. `left_to_right` translates each machine's desktop as one
+        // block, so every screen keeps its exact position relative to its own machine's
+        // others — which is what stops a shared internal boundary becoming a gap the
+        // pointer cannot cross. See `ultidesk_topology::arrange`.
+        let arranged = ultidesk_topology::left_to_right(vec![
+            ultidesk_topology::MachineMonitors {
+                device_id: machines.local,
+                monitors: std::mem::take(&mut found),
+            },
+            ultidesk_topology::MachineMonitors {
+                device_id: machines.remote,
+                monitors: vec![peer_placeholder(machines.remote)],
+            },
+        ]);
         // Saved positions are applied last, so anything the operator arranged wins over
-        // the platform's own idea of where the screens are.
-        stored.borrow().layout.apply(found)
+        // both the platform's idea of where the screens are and the default strip.
+        stored.borrow().layout.apply(arranged.monitors)
     });
     let mut dragging = use_signal(|| None::<(usize, f64, f64)>);
     let mut save_error = use_signal(|| None::<String>);
