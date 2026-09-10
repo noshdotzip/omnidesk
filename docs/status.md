@@ -558,10 +558,9 @@ No inbound firewall rule had to be added on Windows: allow rules for
 `ultidesk-agent.exe` already existed from the TCP-era work, and they name the binary
 rather than a port or protocol, so they carried over to QUIC's UDP unchanged.
 
-**Still blocked, and still needs a person at the Arch machine**: `sudo` there requires a
-password, so `sudo usermod -aG input $USER` could not be run. `input-devices` still
-reports the permission error, and evdev capture — the last piece the KVM daemon needs —
-stays unavailable.
+**Blocked at the time of this run, and resolved the next day**: `sudo` on the Arch
+machine requires a password, so `sudo usermod -aG input $USER` could not be run from
+here. It was run by hand on 2026-09-10 — see the section below.
 
 ## Verified: local IPC on Linux, and evdev unblocked (2026-09-10)
 
