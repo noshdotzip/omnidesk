@@ -45,6 +45,10 @@ use crate::ipc::{Injector, IpcRequest, IpcResponse, Session};
 const MAX_SOCKET_PATH: usize = 107;
 
 /// A bound listener that removes its socket file when dropped.
+///
+/// `Debug` prints the path rather than the socket, so a test that unwraps a `bind`
+/// result — or a diagnostic that logs one — says *which* socket it is talking about.
+#[derive(Debug)]
 pub struct Listener {
     listener: UnixListener,
     path: PathBuf,
