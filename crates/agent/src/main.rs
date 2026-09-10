@@ -1171,20 +1171,25 @@ fn serve() -> Result<()> {
 fn serve() -> Result<()> {
     use std::sync::Arc;
     let ep = endpoint::Endpoint::generate();
-    let listener = unix_socket::bind(std::path::Path::new(&ep.endpoint_path))?;
-
-    // Written only once the socket is bound. A handshake file naming a socket that does
-    // not exist sends the client to a dead path and the failure looks like the agent
-    // crashed rather than never having started.
-    let path = endpoint::write_handshake(&ep)?;
-    // The socket path is fine to log; the token is NOT logged.
-    tracing::info!(socket = %ep.endpoint_path, handshake = %path.display(), "agent IPC listening");
-    println!("{}", path.display());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
+        let listener = unix_socket::bind(std::path::Path::new(&ep.endpoint_path)).await?;
+
+        // Written only once the socket is bound. A handshake file naming a socket that
+        // does not exist sends the client to a dead path, and the failure then looks
+        // like the agent crashed rather than like it never started.
+        let path = endpoint::write_handshake(&ep)?;
+        // The socket path is fine to log; the token is NOT logged.
+        tracing::info!(
+            socket = %ep.endpoint_path,
+            handshake = %path.display(),
+            "agent IPC listening"
+        );
+        println!("{}", path.display());
+
         unix_socket::serve(listener, ep.token.clone(), Arc::new(ipc::RealInjector)).await
     })
 }

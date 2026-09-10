@@ -64,7 +64,18 @@ impl Drop for Listener {
 }
 
 /// Claim `path` and start listening on it.
-pub fn bind(path: &Path) -> anyhow::Result<Listener> {
+///
+/// # Why this is `async` when it never awaits
+/// `tokio::net::UnixListener::bind` registers the socket with the runtime's reactor and
+/// **panics** if there is not one running — with "there is no reactor running", which
+/// says nothing about where the call should have gone. Every test here is a
+/// `#[tokio::test]` and therefore always had a runtime, so the tests could not catch it;
+/// the binary panicked on the first real launch instead.
+///
+/// Making the function `async` moves that precondition into the type system: it cannot
+/// be called from outside an async context, so the panic is unreachable rather than
+/// merely documented.
+pub async fn bind(path: &Path) -> anyhow::Result<Listener> {
     if path.as_os_str().len() > MAX_SOCKET_PATH {
         anyhow::bail!(
             "socket path is {} bytes, over the {MAX_SOCKET_PATH}-byte limit the kernel \
@@ -265,7 +276,7 @@ mod tests {
         let path = d.socket();
         let token = "test-token".to_string();
 
-        let listener = bind(&path).unwrap();
+        let listener = bind(&path).await.unwrap();
         let handle = tokio::spawn(serve(listener, token.clone(), Arc::new(NoopInjector)));
 
         let client = UnixStream::connect(&path).await.unwrap();
@@ -311,7 +322,7 @@ mod tests {
     async fn the_socket_is_reachable_only_by_this_user() {
         let d = TempDir::new("mode");
         let path = d.socket();
-        let listener = bind(&path).unwrap();
+        let listener = bind(&path).await.unwrap();
 
         let dir_mode = std::fs::metadata(path.parent().unwrap())
             .unwrap()
@@ -334,7 +345,9 @@ mod tests {
         drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists(), "the file outlives the listener");
 
-        let listener = bind(&path).expect("a stale file must not block a new listener");
+        let listener = bind(&path)
+            .await
+            .expect("a stale file must not block a new listener");
         assert!(path.exists());
 
         // And the replacement is actually usable, which a bind that merely succeeded
@@ -350,9 +363,11 @@ mod tests {
         // The failure this prevents: two agents both believing they own the session.
         let d = TempDir::new("live");
         let path = d.socket();
-        let first = bind(&path).unwrap();
+        let first = bind(&path).await.unwrap();
 
-        let err = bind(&path).expect_err("a second agent must refuse to start");
+        let err = bind(&path)
+            .await
+            .expect_err("a second agent must refuse to start");
         let message = err.to_string();
         assert!(message.contains("already listening"), "{message}");
         drop(first);
@@ -362,7 +377,7 @@ mod tests {
     async fn the_socket_file_is_removed_when_the_listener_goes_away() {
         let d = TempDir::new("cleanup");
         let path = d.socket();
-        let listener = bind(&path).unwrap();
+        let listener = bind(&path).await.unwrap();
         assert!(path.exists());
         drop(listener);
         assert!(
@@ -377,7 +392,9 @@ mod tests {
         // enough to reach it.
         let d = TempDir::new("long");
         let path = d.0.join("x".repeat(200));
-        let err = bind(&path).expect_err("an over-long path must be refused");
+        let err = bind(&path)
+            .await
+            .expect_err("an over-long path must be refused");
         assert!(err.to_string().contains("byte limit"), "{err}");
     }
 }
