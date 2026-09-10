@@ -867,10 +867,13 @@ fn peers() -> Result<()> {
     }
     for peer in store.peers() {
         println!(
-            "{}  {}  [{}]  {}",
+            "{}  {}  [{}]  last seen at {}  {}",
             peer.key.fingerprint(),
             peer.name,
             describe(&peer.permissions),
+            // Shown because it is what the relay will try, and "never reached" is the
+            // answer to a question an operator would otherwise have to guess at.
+            peer.address.as_deref().unwrap_or("(never reached)"),
             peer.key
         );
     }

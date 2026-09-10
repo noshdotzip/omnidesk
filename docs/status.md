@@ -794,19 +794,65 @@ graphical session, so the agent must be given `XDG_RUNTIME_DIR` and `WAYLAND_DIS
 explicitly. Started normally inside the session it inherits both, and the error when it
 cannot connect says so.
 
+## Verified: the relay (2026-09-10)
+
+The control app speaks only to its own agent — it has no identity, holds no pinned keys,
+and a second connection from a second process would mean a second thing to authenticate
+and two answers that could disagree. `AskPeer` closes that: the agent puts the question to
+the peer and hands the answer back.
+
+Demonstrated on the Windows machine against the Arch peer:
+
+- With no address known: `peer_address_unknown: arch-x64 has never been reached from this
+  device, so there is no address to try; discovery does not exist yet`. A specific answer,
+  not a failure to connect.
+- One direct `peer-monitors` teaches the address, which `peers` now shows as
+  `last seen at 192.168.137.9:45872`.
+- `ask-peer monitors` then finds the peer on its own: `from 7BAB-CD56-D896-A2A1-1BD0`,
+  `eDP-1`, 1920 wide. `ask-peer devices` returns all 6 endpoints through the same path.
+
+**Relaying is not a permission, and cannot be granted.** A peer able to relay would reach
+a third machine it was never paired with, wearing this machine's trust to do it — so the
+gate grew a second axis, `LocalOnly`, that no grant can express. A peer allowed everything
+is still refused, which is pinned by a test. Belt and braces: the peer-facing transports
+are built with no relay context at all, so a mistake in the gate leaves nothing to hop
+with.
+
+**The ownership check stays where it can be made.** Only the party that completed the
+handshake knows which key was proved, and that is the agent. So the check runs before the
+answer is relayed at all, and the reply carries the peer's key so the answer says whose it
+is. That is a statement about a check already performed rather than one the caller is
+expected to repeat: a control app that could not trust its own agent has already lost,
+since that agent injects its input and holds its private key.
+
+**403 tests on Windows ARM64, 409 on Arch.** Clippy `-D warnings` and `cargo fmt --check`
+clean on both.
+
+A structural note worth keeping: `Session::dispatch` now returns a *decision* rather than
+always a reply. `AskPeer` cannot be answered without network I/O, and the gate is
+deliberately synchronous so that authentication and permissions stay unit-testable without
+a runtime — so it authorises and hands the work back to the transport that has one. The
+alternative, intercepting the message in each transport, would need the gate repeated per
+transport, and the copy that was forgotten would be the way in.
+
+The stored address is a **hint, never an identity**. Nothing compares addresses; the key
+alone decides who a connection is. A missing address therefore has no security meaning,
+which is why adding the field needed no schema bump — unlike a missing permission, where
+absence had to be read as "granted nothing".
+
 ## Exact next step
 
-**The relay.** The agent can now answer for itself — monitors and audio devices, over
-every transport — but the control app still talks to no agent: it enumerates in-process
-and its peer panels are placeholders. Making them real means the control app asking its
-local agent, and the local agent asking the peer.
+**Put the control app on the relay.** Everything under it now exists: the agent answers
+for itself and for a peer, over a transport that exists on both platforms. What is missing
+is the client — the control app still enumerates in-process and its peer panels are
+placeholders, because nothing in it speaks the local IPC.
 
-The decision that has to come first: a relayed reply carries a device id the relaying
-machine cannot vouch for. The ownership check that makes `peer-devices` and
-`peer-monitors` safe lives in the *asking* process, and the moment the control app is the
-one asking, that check has to move with it — which means a relayed answer has to carry
-the peer key it came from, not just the payload.
+Two things follow immediately once it does, and both are the point rather than extras:
 
-After that, the two enumerators become one: the control app should read monitors from the
-agent rather than from `tao`, which is what removes the disagreement documented above
-rather than merely detecting it.
+1. The peer panels stop being placeholders — a peer's monitors and audio endpoints are one
+   `AskPeer` away, and `ultidesk_topology::left_to_right` already places whatever monitors
+   it is handed.
+2. The control app should read *its own* monitors from the agent too, rather than from
+   `tao`. That is what removes the two-enumerator disagreement documented above instead of
+   only detecting it — and the DPI bug it caught is the argument for doing it.
+

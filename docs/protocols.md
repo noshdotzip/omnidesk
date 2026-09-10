@@ -48,6 +48,14 @@ by the discriminated unions in `apps/desktop/src/shared/protocol.ts`:
 - `ReleaseAllInput` → `Released { count }`
 - `ListAudioDevices` → `AudioDevices { devices: AudioDevice[] }` | `Error`
 - `ListMonitors` → `Monitors { monitors: Monitor[] }` | `Error`
+- `AskPeer { peer, query }` → `PeerAudioDevices { peer, devices }` | `PeerMonitors { peer, monitors }` | `Error`
+
+`AskPeer` is **local-callers only**, and that is not a permission an operator can grant:
+a peer able to relay could reach a third machine it was never paired with, using this one
+as a hop. Its `query` is a closed list rather than a nested request, so a relay cannot
+relay a relay. The relayed answer carries the peer's key, and every item in it was checked
+against the key that completed the agent's handshake before being passed on — the agent is
+the only party that can make that check, because it is the only one that authenticated.
 
 `ListAudioDevices` and `ListMonitors` are the settings surface as it stands, and are the
 same messages the peer channel carries. A monitor's position is in the **sending

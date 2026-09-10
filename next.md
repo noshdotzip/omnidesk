@@ -83,14 +83,19 @@ risk was real and paid off immediately: the two disagreed by a factor of 1.5 on 
 run, because the agent had never declared DPI awareness. Fixed, and the fix is why the
 next item matters — the disagreement is currently *detected*, not *removed*.
 
-The relay has its own decision: the local agent can vouch for its own answers and not for
-a peer's, so a relayed reply has to carry the peer key it came from, or the ownership
-check that makes `peer-devices` and `peer-monitors` safe is lost the moment the control
-app is the one asking.
+~~The relay has its own decision~~ — **built 2026-09-10.** It resolved the other way than
+expected: the ownership check does not move to the caller, it *stays* with the agent,
+because the agent is the only party that authenticated the peer and therefore the only one
+that can make it. The relayed answer carries the peer's key so it says whose it is.
 
-Once the relay exists, the control app should read *its own* monitors from the agent too,
-rather than from `tao`. That is what removes the two-enumerator disagreement instead of
-only noticing it.
+Relaying turned out not to be a permission at all. A peer able to relay would reach a
+third machine it was never paired with using this one as a hop, so the gate grew a second
+axis — `LocalOnly` — that no grant can express.
+
+**What is left is the client.** The control app still speaks to no agent, so its peer
+panels are placeholders even though the answers are now one `AskPeer` away. Once it does
+speak, it should also read its *own* monitors from the agent rather than from `tao`, which
+removes the two-enumerator disagreement instead of only noticing it.
 
 ~~**Decide the coordinate space before writing the monitor request.**~~ **Decided and
 built 2026-09-10.** Machines start in a strip, left to right, in the order they
