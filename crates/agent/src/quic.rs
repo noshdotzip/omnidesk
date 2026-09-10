@@ -71,11 +71,20 @@ pub async fn serve(
             // rather than unwrapped: a peer that authenticated must never be dropped
             // because its label is missing.
             .unwrap_or_else(|| conn.peer_key().fingerprint());
+        // Read once, from the store, for the key the handshake proved. A peer cannot
+        // assert its own permissions and cannot change them by reconnecting to a
+        // different name.
+        let permissions = peers.permissions(&conn.peer_key());
         let backends = backends.clone();
 
         tokio::spawn(async move {
-            tracing::info!(peer = %name, addr = %conn.remote_address(), "peer connected");
-            if let Err(e) = serve_connection(&conn, backends).await {
+            tracing::info!(
+                peer = %name,
+                addr = %conn.remote_address(),
+                allowed = ?permissions.granted(),
+                "peer connected"
+            );
+            if let Err(e) = serve_connection(&conn, backends, permissions).await {
                 tracing::warn!(peer = %name, error = %e, "peer connection ended with error");
             }
             tracing::info!(peer = %name, "peer disconnected");
@@ -93,6 +102,7 @@ pub async fn serve(
 async fn serve_connection(
     conn: &PeerConnection,
     backends: Arc<LocalBackends>,
+    permissions: ultidesk_identity::Permissions,
 ) -> anyhow::Result<()> {
     let mut streams = tokio::task::JoinSet::new();
     while let Some(stream) = conn.accept_control().await {
@@ -101,7 +111,7 @@ async fn serve_connection(
         streams.spawn(async move {
             // One session per stream, so the held-input bookkeeping — and therefore the
             // release below — is scoped to exactly the stream that pressed the keys.
-            let mut session = Session::for_authenticated_peer();
+            let mut session = Session::for_authenticated_peer(permissions);
             let result = pump(&mut stream, &mut session, backends.as_ref()).await;
 
             // However the stream ended — cleanly, a crash, a pulled cable — anything it

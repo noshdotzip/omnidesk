@@ -7,6 +7,14 @@
 //! shown to the operator, and code that decides whether to accept a connection must
 //! ask [`PeerStore::trusts`] rather than comparing strings.
 //!
+//! # Pairing is not a blank cheque
+//! Trusting a device and letting it do *anything* are different decisions, and until now
+//! they were the same one. [`Permissions`] splits them per peer, enforced on the machine
+//! that owns the capability — a peer claiming it is allowed to do something is never
+//! sufficient (docs/permissions.md). The default for a missing field is `false`, so a
+//! store that is damaged, truncated, or written by a build that knew fewer permissions
+//! grants less rather than more.
+//!
 //! # An unreadable store trusts nobody
 //! If the file cannot be parsed, the store loads empty and the damaged file is moved
 //! aside instead of being overwritten. Empty is the safe direction: every connection is
@@ -23,7 +31,13 @@ use crate::key::PeerKey;
 pub const PEERS_FILE: &str = "peers.json";
 
 /// Schema version. Bumped when a field changes meaning rather than merely being added.
-pub const PEERS_VERSION: u32 = 1;
+///
+/// v2 added [`Permissions`]. A v1 file is migrated rather than defaulted: every peer in
+/// it was pinned when pairing meant unrestricted access, so that is what it granted, and
+/// silently reducing it to nothing would break a working setup with no explanation. The
+/// migration writes the grant out explicitly, so what was implied becomes visible and
+/// revocable.
+pub const PEERS_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PeerStoreError {
@@ -34,6 +48,11 @@ pub enum PeerStoreError {
         source: std::io::Error,
     },
 }
+
+/// A permission name this build does not know.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown permission {0:?}; expected one of: control-input, read-devices, list-windows")]
+pub struct UnknownPermission(pub String);
 
 /// Why a pin was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -62,6 +81,95 @@ pub enum PinOutcome {
     Unchanged,
 }
 
+/// What this machine lets one peer do to it.
+///
+/// Each field is a separate decision because the answers genuinely differ: someone may
+/// want a work laptop able to read which speakers this machine has without also being
+/// able to type on it.
+///
+/// # Why window listing is not folded into reading devices
+/// A window list carries **titles**, and a title says what the operator is doing — the
+/// document they have open, the site they are reading, the name of a customer. An audio
+/// endpoint list says a machine has speakers. Granting one should not grant the other.
+///
+/// # Why the default is nothing
+/// `#[serde(default)]` on every field means an absent or unrecognised entry reads as
+/// `false`. A store this build cannot fully understand therefore grants *less* than the
+/// file intended, never more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Permissions {
+    /// Move this machine's pointer, press its keys, turn its wheel.
+    pub control_input: bool,
+    /// Read what this machine *has* — its audio endpoints today; its monitors and
+    /// topology as those messages land.
+    pub read_devices: bool,
+    /// List this machine's open windows, titles included.
+    pub list_windows: bool,
+}
+
+impl Permissions {
+    /// Everything this build knows how to grant.
+    ///
+    /// Used for the v1 migration and for the local IPC, and deliberately *not* the
+    /// default for a new pairing.
+    pub fn all() -> Self {
+        Permissions {
+            control_input: true,
+            read_devices: true,
+            list_windows: true,
+        }
+    }
+
+    /// What a freshly paired peer gets.
+    ///
+    /// Input and device reading, because driving another machine is what someone paired
+    /// two machines *for* and refusing it by default would make pairing look broken.
+    /// Window titles are not included: they are the one thing here that leaks what the
+    /// operator is doing, and nothing asks for them until window projection exists.
+    pub fn on_pairing() -> Self {
+        Permissions {
+            control_input: true,
+            read_devices: true,
+            list_windows: false,
+        }
+    }
+
+    /// The granted names, for showing an operator what a peer may do.
+    pub fn granted(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.control_input {
+            out.push("control-input");
+        }
+        if self.read_devices {
+            out.push("read-devices");
+        }
+        if self.list_windows {
+            out.push("list-windows");
+        }
+        out
+    }
+
+    /// Set one permission by its operator-facing name.
+    ///
+    /// Returns `false` for a name this build does not know, so a typo at the command
+    /// line is reported rather than silently changing nothing.
+    pub fn set_named(&mut self, name: &str, allowed: bool) -> bool {
+        match name {
+            "control-input" => self.control_input = allowed,
+            "read-devices" => self.read_devices = allowed,
+            "list-windows" => self.list_windows = allowed,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Every name [`Permissions::set_named`] accepts, for usage messages.
+    pub fn names() -> [&'static str; 3] {
+        ["control-input", "read-devices", "list-windows"]
+    }
+}
+
 /// One trusted device.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PairedPeer {
@@ -70,6 +178,9 @@ pub struct PairedPeer {
     pub name: String,
     /// Unix seconds, so the store needs no date library and no timezone.
     pub paired_at_unix: u64,
+    /// What this machine lets the peer do. Absent in a v1 file; see [`PEERS_VERSION`].
+    #[serde(default)]
+    pub permissions: Permissions,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -92,6 +203,13 @@ pub struct PeerStore {
 pub struct LoadedPeers {
     pub store: PeerStore,
     pub note: Option<String>,
+    /// The file was an older schema and was upgraded in memory.
+    ///
+    /// Reported rather than written here, because a function called `load` that silently
+    /// rewrites the file it read is a surprise — and because a read-only command should
+    /// stay read-only. The caller saves once, which is also what stops the migration
+    /// note from being printed on every single launch forever.
+    pub migrated: bool,
 }
 
 impl PeerStore {
@@ -150,8 +268,37 @@ impl PeerStore {
             key,
             name: name.to_string(),
             paired_at_unix: now_unix,
+            permissions: Permissions::on_pairing(),
         });
         Ok(PinOutcome::Added)
+    }
+
+    /// What a peer is allowed to do, or nothing at all if it is not paired.
+    ///
+    /// An unknown peer getting [`Permissions::default`] rather than an `Option` is the
+    /// safe shape: a caller that forgets to handle the missing case still denies
+    /// everything, where an `unwrap_or_else(Permissions::all)` slip would grant it.
+    pub fn permissions(&self, key: &PeerKey) -> Permissions {
+        self.get(key).map(|p| p.permissions).unwrap_or_default()
+    }
+
+    /// Grant or revoke one permission for one peer.
+    ///
+    /// `Ok(false)` means the peer is not paired — reported rather than silently creating
+    /// a grant for a device this machine does not trust.
+    pub fn set_permission(
+        &mut self,
+        key: &PeerKey,
+        name: &str,
+        allowed: bool,
+    ) -> Result<bool, UnknownPermission> {
+        let Some(peer) = self.peers.iter_mut().find(|p| &p.key == key) else {
+            return Ok(false);
+        };
+        if !peer.permissions.set_named(name, allowed) {
+            return Err(UnknownPermission(name.to_string()));
+        }
+        Ok(true)
     }
 
     /// Revoke trust. Returns whether anything was actually removed, so a caller can
@@ -197,6 +344,7 @@ pub fn load(dir: &Path, local: PeerKey) -> LoadedPeers {
     let empty = |note: Option<String>| LoadedPeers {
         store: PeerStore::new(local),
         note,
+        migrated: false,
     };
 
     let raw = match std::fs::read_to_string(&path) {
@@ -228,12 +376,28 @@ pub fn load(dir: &Path, local: PeerKey) -> LoadedPeers {
         return empty(Some(note));
     }
 
+    let mut peers = parsed.peers;
+    let mut note = None;
+    let migrated = parsed.version < PEERS_VERSION;
+    if parsed.version < 2 {
+        // Everything in a v1 file was pinned when pairing meant unrestricted access.
+        // Granting that explicitly keeps a working setup working; defaulting it to
+        // nothing would break it silently, which is the worse of the two surprises.
+        for peer in &mut peers {
+            peer.permissions = Permissions::all();
+        }
+        note = Some(format!(
+            "{} was written before per-peer permissions existed; {} peer(s) kept the \
+             unrestricted access pairing used to mean. Review it with `peers`.",
+            path.display(),
+            peers.len()
+        ));
+    }
+
     LoadedPeers {
-        store: PeerStore {
-            local,
-            peers: parsed.peers,
-        },
-        note: None,
+        store: PeerStore { local, peers },
+        note,
+        migrated,
     }
 }
 
@@ -381,6 +545,162 @@ mod tests {
             d.path().join("peers.json.unreadable").exists(),
             "the damaged file must survive for inspection"
         );
+    }
+
+    #[test]
+    fn a_new_pairing_grants_input_and_devices_but_not_window_titles() {
+        let (local, peer, _) = keys();
+        let mut store = PeerStore::new(local);
+        store.pin(peer, "laptop", 1).unwrap();
+
+        let p = store.permissions(&peer);
+        assert!(
+            p.control_input,
+            "driving the machine is what pairing is for"
+        );
+        assert!(p.read_devices);
+        assert!(
+            !p.list_windows,
+            "titles say what the operator is doing; nothing asks for them yet"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_is_not_paired_is_allowed_nothing() {
+        // The shape matters: returning `Permissions::default()` rather than an Option
+        // means a caller that forgets the missing case still denies everything.
+        let (local, stranger, _) = keys();
+        assert_eq!(
+            PeerStore::new(local).permissions(&stranger),
+            Permissions::default()
+        );
+        assert!(Permissions::default().granted().is_empty());
+    }
+
+    #[test]
+    fn permissions_can_be_granted_and_revoked_by_name() {
+        let (local, peer, _) = keys();
+        let mut store = PeerStore::new(local);
+        store.pin(peer, "laptop", 1).unwrap();
+
+        assert_eq!(store.set_permission(&peer, "list-windows", true), Ok(true));
+        assert!(store.permissions(&peer).list_windows);
+
+        assert_eq!(
+            store.set_permission(&peer, "control-input", false),
+            Ok(true)
+        );
+        assert!(!store.permissions(&peer).control_input);
+        assert!(
+            store.permissions(&peer).read_devices,
+            "changing one permission must not disturb the others"
+        );
+    }
+
+    #[test]
+    fn granting_to_an_unpaired_device_reports_that_rather_than_creating_a_grant() {
+        let (local, stranger, _) = keys();
+        let mut store = PeerStore::new(local);
+        assert_eq!(
+            store.set_permission(&stranger, "read-devices", true),
+            Ok(false)
+        );
+        assert!(!store.trusts(&stranger));
+    }
+
+    #[test]
+    fn a_misspelled_permission_is_refused_rather_than_ignored() {
+        // Silently doing nothing would leave an operator believing they had revoked
+        // something.
+        let (local, peer, _) = keys();
+        let mut store = PeerStore::new(local);
+        store.pin(peer, "laptop", 1).unwrap();
+        assert!(store.set_permission(&peer, "control_input", false).is_err());
+        assert!(
+            store.permissions(&peer).control_input,
+            "a refused change must change nothing"
+        );
+    }
+
+    #[test]
+    fn permissions_round_trip_through_the_file() {
+        let d = TempDir::new("perm-round-trip");
+        let (local, peer, _) = keys();
+        let mut store = PeerStore::new(local);
+        store.pin(peer, "arch", 1).unwrap();
+        store.set_permission(&peer, "control-input", false).unwrap();
+        store.set_permission(&peer, "list-windows", true).unwrap();
+        store.save(d.path()).unwrap();
+
+        let loaded = load(d.path(), local);
+        let p = loaded.store.permissions(&peer);
+        assert!(!p.control_input);
+        assert!(p.read_devices);
+        assert!(p.list_windows);
+    }
+
+    #[test]
+    fn a_v1_file_is_migrated_to_the_access_it_used_to_mean() {
+        // Everything in a v1 file was pinned when pairing meant unrestricted access.
+        // Defaulting it to nothing would break a working setup with no explanation.
+        let d = TempDir::new("perm-v1");
+        let (local, peer, _) = keys();
+        let raw = format!(
+            r#"{{"version":1,"peers":[{{"key":"{peer}","name":"arch","paired_at_unix":7}}]}}"#
+        );
+        std::fs::write(d.path().join(PEERS_FILE), raw).unwrap();
+
+        let loaded = load(d.path(), local);
+        assert_eq!(loaded.store.permissions(&peer), Permissions::all());
+        assert!(
+            loaded.note.is_some(),
+            "an implicit grant becoming explicit has to be told to the operator"
+        );
+        assert!(loaded.migrated, "the caller has to know to write it back");
+
+        // Written back once, after which the file is current and says nothing further.
+        loaded.store.save(d.path()).unwrap();
+        let again = load(d.path(), local);
+        assert!(!again.migrated);
+        assert!(
+            again.note.is_none(),
+            "the migration note must not repeat on every launch"
+        );
+        assert_eq!(again.store.permissions(&peer), Permissions::all());
+    }
+
+    #[test]
+    fn a_v2_entry_with_no_permissions_field_grants_nothing() {
+        // Not the same case as v1: this file claims to know about permissions and simply
+        // lists none, so the safe reading is that none were granted.
+        let d = TempDir::new("perm-absent");
+        let (local, peer, _) = keys();
+        let raw = format!(
+            r#"{{"version":2,"peers":[{{"key":"{peer}","name":"arch","paired_at_unix":7}}]}}"#
+        );
+        std::fs::write(d.path().join(PEERS_FILE), raw).unwrap();
+
+        let loaded = load(d.path(), local);
+        assert_eq!(loaded.store.permissions(&peer), Permissions::default());
+        assert!(loaded.store.trusts(&peer), "still paired, just not allowed");
+    }
+
+    #[test]
+    fn an_unrecognised_permission_in_the_file_is_ignored_rather_than_obeyed() {
+        // A file from a build that knows more permissions must not be read as granting
+        // something this build cannot enforce.
+        let d = TempDir::new("perm-unknown");
+        let (local, peer, _) = keys();
+        let raw = format!(
+            r#"{{"version":2,"peers":[{{"key":"{peer}","name":"arch","paired_at_unix":7,
+               "permissions":{{"read_devices":true,"read_clipboard":true}}}}]}}"#
+        );
+        std::fs::write(d.path().join(PEERS_FILE), raw).unwrap();
+
+        let loaded = load(d.path(), local);
+        let p = loaded.store.permissions(&peer);
+        assert!(p.read_devices, "the ones it does know still apply");
+        assert_eq!(p.granted(), vec!["read-devices"]);
     }
 
     #[test]

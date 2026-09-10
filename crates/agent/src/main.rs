@@ -16,7 +16,10 @@
 //!                              both screens, then pin its key.
 //!                              pair            wait for a peer to dial in
 //!                              pair host:port  dial a peer that is waiting
-//!   ultidesk-agent peers       List trusted devices. `peers forget <key>` revokes one.
+//!   ultidesk-agent peers       List trusted devices and what each may do.
+//!                              peers forget <key>        revoke trust entirely
+//!                              peers allow  <key> <perm> grant one permission
+//!                              peers deny   <key> <perm> revoke one permission
 //!   ultidesk-agent serve-peer  Serve paired peers over the authenticated QUIC channel
 //!                              (ADR-0002). No token: a peer is admitted by its key.
 //!   ultidesk-agent peer-ping   Round-trip a Ping against a paired peer and report the
@@ -509,14 +512,16 @@ fn serve_peer() -> Result<()> {
         .context("the bind address must be host:port, e.g. 0.0.0.0:45872")?;
 
     let (dir, identity) = local_identity()?;
-    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
-    if let Some(note) = loaded.note {
-        eprintln!("WARNING: {note}");
-    }
+    let store = load_peers(&dir, identity.public())?;
 
     println!("this machine: {}", identity.fingerprint());
-    for peer in loaded.store.peers() {
-        println!("paired with: {} ({})", peer.name, peer.key.fingerprint());
+    for peer in store.peers() {
+        println!(
+            "paired with: {} ({}) [{}]",
+            peer.name,
+            peer.key.fingerprint(),
+            describe(&peer.permissions)
+        );
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -526,7 +531,7 @@ fn serve_peer() -> Result<()> {
         choose_injector()?,
         identity.device_id(),
     ));
-    rt.block_on(quic::serve(&identity, bind, &loaded.store, backends))
+    rt.block_on(quic::serve(&identity, bind, &store, backends))
 }
 
 /// Round-trip a Ping against a paired peer, and report the latency of the real path.
@@ -544,15 +549,12 @@ fn peer_ping() -> Result<()> {
         .unwrap_or(5);
 
     let (dir, identity) = local_identity()?;
-    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
-    if let Some(note) = &loaded.note {
-        eprintln!("WARNING: {note}");
-    }
+    let store = load_peers(&dir, identity.public())?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(quic::peer_ping(&identity, &loaded.store, addr, count))
+    rt.block_on(quic::peer_ping(&identity, &store, addr, count))
 }
 
 /// Ask a paired peer for its audio endpoints — the first settings-IPC message.
@@ -564,15 +566,12 @@ fn peer_devices() -> Result<()> {
         .context("the peer address must be host:port")?;
 
     let (dir, identity) = local_identity()?;
-    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
-    if let Some(note) = &loaded.note {
-        eprintln!("WARNING: {note}");
-    }
+    let store = load_peers(&dir, identity.public())?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let devices = rt.block_on(quic::peer_audio_devices(&identity, &loaded.store, addr))?;
+    let devices = rt.block_on(quic::peer_audio_devices(&identity, &store, addr))?;
     println!("{}", serde_json::to_string_pretty(&devices)?);
     tracing::info!(count = devices.len(), "read a peer's audio endpoints");
     Ok(())
@@ -585,11 +584,7 @@ fn peer_devices() -> Result<()> {
 fn pair() -> Result<()> {
     let target = std::env::args().nth(2);
     let (dir, identity) = local_identity()?;
-    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
-    if let Some(note) = &loaded.note {
-        eprintln!("WARNING: {note}");
-    }
-    let mut store = loaded.store;
+    let mut store = load_peers(&dir, identity.public())?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -639,30 +634,57 @@ fn pair() -> Result<()> {
     Ok(())
 }
 
-/// List the devices this machine trusts, or revoke one with `peers forget <key>`.
+/// List trusted devices, or change what one is allowed to do.
+///
+///     peers                        list
+///     peers forget <key>           revoke trust entirely
+///     peers allow  <key> <perm>    grant one permission
+///     peers deny   <key> <perm>    revoke one permission
 fn peers() -> Result<()> {
     let (dir, identity) = local_identity()?;
-    let loaded = ultidesk_identity::peers::load(&dir, identity.public());
-    if let Some(note) = &loaded.note {
-        eprintln!("WARNING: {note}");
-    }
-    let mut store = loaded.store;
+    let mut store = load_peers(&dir, identity.public())?;
 
-    if let (Some("forget"), Some(key_text)) =
-        (std::env::args().nth(2).as_deref(), std::env::args().nth(3))
-    {
-        let key = ultidesk_identity::PeerKey::parse(&key_text).ok_or_else(|| {
-            anyhow::anyhow!("not a public key; pass the 64-character value from `identity`")
-        })?;
-        // Reported honestly rather than always claiming success: "forgotten" and "was
-        // never there" are different answers to the same command.
-        if store.forget(&key) {
-            store.save(&dir)?;
-            println!("forgot {}", key.fingerprint());
-        } else {
-            println!("{} was not paired", key.fingerprint());
+    let verb = std::env::args().nth(2);
+    match verb.as_deref() {
+        Some("forget") => {
+            let key = peer_key_arg(3)?;
+            // Reported honestly rather than always claiming success: "forgotten" and
+            // "was never there" are different answers to the same command.
+            if store.forget(&key) {
+                store.save(&dir)?;
+                println!("forgot {}", key.fingerprint());
+            } else {
+                println!("{} was not paired", key.fingerprint());
+            }
+            return Ok(());
         }
-        return Ok(());
+        Some(v @ ("allow" | "deny")) => {
+            let key = peer_key_arg(3)?;
+            let name = std::env::args().nth(4).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "usage: ultidesk-agent peers {v} <key> <{}>",
+                    ultidesk_identity::Permissions::names().join("|")
+                )
+            })?;
+            let allowed = v == "allow";
+            if !store.set_permission(&key, &name, allowed)? {
+                anyhow::bail!(
+                    "{} is not paired, so there is nothing to {v}",
+                    key.fingerprint()
+                );
+            }
+            store.save(&dir)?;
+            println!(
+                "{} may now: {}",
+                key.fingerprint(),
+                describe(&store.permissions(&key))
+            );
+            return Ok(());
+        }
+        Some(other) => {
+            anyhow::bail!("unknown peers command {other:?}; expected forget, allow or deny")
+        }
+        None => {}
     }
 
     println!(
@@ -674,9 +696,57 @@ fn peers() -> Result<()> {
         println!("no peers are paired; run `ultidesk-agent pair`");
     }
     for peer in store.peers() {
-        println!("{}  {}  {}", peer.key.fingerprint(), peer.name, peer.key);
+        println!(
+            "{}  {}  [{}]  {}",
+            peer.key.fingerprint(),
+            peer.name,
+            describe(&peer.permissions),
+            peer.key
+        );
     }
     Ok(())
+}
+
+/// What a peer may do, or a plain statement that it may do nothing.
+///
+/// Spelled out rather than shown as an empty list: "nothing" is a state an operator
+/// should be able to read at a glance, not infer from blank space.
+fn describe(permissions: &ultidesk_identity::Permissions) -> String {
+    let granted = permissions.granted();
+    if granted.is_empty() {
+        "nothing".to_string()
+    } else {
+        granted.join(", ")
+    }
+}
+
+/// Read a peer's public key from argument `n`.
+fn peer_key_arg(n: usize) -> Result<ultidesk_identity::PeerKey> {
+    let text = std::env::args()
+        .nth(n)
+        .ok_or_else(|| anyhow::anyhow!("expected a peer public key"))?;
+    ultidesk_identity::PeerKey::parse(&text).ok_or_else(|| {
+        anyhow::anyhow!("not a public key; pass the 64-character value `peers` prints")
+    })
+}
+
+/// The peers this machine trusts, upgrading the store's schema once if it is old.
+///
+/// The write happens here rather than inside `load` so that reading stays reading — but
+/// it does have to happen somewhere, or the "these peers kept their old access" warning
+/// is printed on every launch for ever and stops being read.
+fn load_peers(
+    dir: &std::path::Path,
+    local: ultidesk_identity::PeerKey,
+) -> Result<ultidesk_identity::PeerStore> {
+    let loaded = ultidesk_identity::peers::load(dir, local);
+    if let Some(note) = &loaded.note {
+        eprintln!("WARNING: {note}");
+    }
+    if loaded.migrated {
+        loaded.store.save(dir)?;
+    }
+    Ok(loaded.store)
 }
 
 /// This machine's configuration directory and identity, or a message saying why not.

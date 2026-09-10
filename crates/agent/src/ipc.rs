@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use ultidesk_core::protocol::PROTOCOL_VERSION;
+use ultidesk_identity::Permissions;
 use ultidesk_platform_windows::inject::{InputError, MouseButton, VirtualScreen};
 use ultidesk_topology::AudioDevice;
 
@@ -263,6 +264,62 @@ impl Injector for RealInjector {
     }
 }
 
+/// Which permission a request needs, or `None` when it needs none.
+///
+/// A single `match` with no wildcard arm on purpose: adding a request to [`IpcRequest`]
+/// then fails to compile until someone has decided what it costs. A `_ => None` default
+/// would let the next message ship ungated, and it would ship silently.
+fn required_permission(req: &IpcRequest) -> Option<Needed> {
+    match req {
+        // Liveness. Refusing it would make "the peer is gone" and "the peer denies me"
+        // look identical, and it discloses nothing that completing the handshake did not.
+        IpcRequest::Ping => None,
+        // Handled by the authentication gate above, not by a permission.
+        IpcRequest::Hello { .. } => None,
+
+        IpcRequest::InjectMouseMove { .. }
+        | IpcRequest::InjectMouseButton { .. }
+        | IpcRequest::InjectKey { .. }
+        | IpcRequest::InjectScroll { .. } => Some(Needed::ControlInput),
+
+        // Releasing is *not* gated, deliberately. It only ever undoes what this session
+        // already did, and a peer whose input permission is revoked mid-connection must
+        // still be able to let go of a held key — refusing would leave a modifier stuck
+        // down on this machine, which is exactly the failure the release path exists to
+        // prevent.
+        IpcRequest::ReleaseAllInput => None,
+
+        IpcRequest::EnumerateWindows => Some(Needed::ListWindows),
+        IpcRequest::ListAudioDevices => Some(Needed::ReadDevices),
+    }
+}
+
+/// One permission, in the form the gate needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Needed {
+    ControlInput,
+    ReadDevices,
+    ListWindows,
+}
+
+impl Needed {
+    fn granted_by(self, p: &Permissions) -> bool {
+        match self {
+            Needed::ControlInput => p.control_input,
+            Needed::ReadDevices => p.read_devices,
+            Needed::ListWindows => p.list_windows,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Needed::ControlInput => "control-input",
+            Needed::ReadDevices => "read-devices",
+            Needed::ListWindows => "list-windows",
+        }
+    }
+}
+
 /// Per-connection session state. Tracks authentication and, critically, every key and
 /// button currently held *by this session*, so a dropped connection can release them
 /// and never leave the source machine with a stuck modifier (brief §10, acceptance
@@ -277,6 +334,12 @@ pub struct Session {
     /// one in per call meant the transport that does not use tokens had to invent a
     /// value to pass — and an empty string would have matched an empty `Hello`.
     expected_token: Option<String>,
+    /// What the far end is allowed to ask for, once authenticated.
+    ///
+    /// Held per session rather than looked up per request: the peer is decided by the
+    /// handshake and cannot change mid-connection, and re-reading the store on every
+    /// pointer move would put a file read on the input hot path.
+    permissions: Permissions,
     authenticated: bool,
     held_buttons: HashSet<MouseButton>,
     held_scancodes: HashSet<u16>,
@@ -285,9 +348,17 @@ pub struct Session {
 impl Session {
     /// A session gated by a shared secret: the local named pipe, and the dev TCP peer
     /// transport.
+    /// A session gated by a shared secret, and allowed everything.
+    ///
+    /// Not an oversight: the only holder of the token is a process running as this user
+    /// on this machine, which can already do anything the agent can — it could drive the
+    /// same APIs directly, or read the agent's own key file. A permission check there
+    /// would be theatre, and pretending otherwise would make the *peer* checks look like
+    /// the same kind of gesture. Permissions exist for the far end of a network.
     pub fn new(expected_token: &str) -> Self {
         Session {
             expected_token: Some(expected_token.to_string()),
+            permissions: Permissions::all(),
             authenticated: false,
             held_buttons: HashSet::new(),
             held_scancodes: HashSet::new(),
@@ -301,9 +372,10 @@ impl Session {
     /// negotiates the protocol version through ALPN. There is nothing left for a `Hello`
     /// to establish, so one is refused as a duplicate rather than being a second, weaker
     /// way in.
-    pub fn for_authenticated_peer() -> Self {
+    pub fn for_authenticated_peer(permissions: Permissions) -> Self {
         Session {
             expected_token: None,
+            permissions,
             authenticated: true,
             held_buttons: HashSet::new(),
             held_scancodes: HashSet::new(),
@@ -355,6 +427,20 @@ impl Session {
                     };
                 }
                 _ => return err("unauthenticated", "must send Hello first"),
+            }
+        }
+
+        if let Some(needed) = required_permission(&req) {
+            if !needed.granted_by(&self.permissions) {
+                // Named, so an operator reading the peer's log knows which grant to
+                // change rather than only that something was refused.
+                return err(
+                    "not_permitted",
+                    &format!(
+                        "this device does not allow {:?} for the peer on this session",
+                        needed.name()
+                    ),
+                );
             }
         }
 
@@ -549,7 +635,7 @@ mod tests {
     fn a_transport_authenticated_peer_needs_no_hello() {
         // The QUIC path: the handshake already proved which device this is, so the
         // first message may be a command.
-        let mut s = Session::for_authenticated_peer();
+        let mut s = Session::for_authenticated_peer(Permissions::all());
         let inj = MockInjector::default();
         let audio = MockAudio(Ok(Vec::new()));
         assert!(s.is_authenticated());
@@ -563,7 +649,7 @@ mod tests {
     fn a_transport_authenticated_peer_cannot_offer_a_token() {
         // There is nothing for a Hello to establish, and accepting one would be a
         // second, weaker way in beside the handshake.
-        let mut s = Session::for_authenticated_peer();
+        let mut s = Session::for_authenticated_peer(Permissions::all());
         let inj = MockInjector::default();
         let audio = MockAudio(Ok(Vec::new()));
         let r = s.handle(
@@ -770,6 +856,165 @@ mod tests {
         );
         s.handle(IpcRequest::ListAudioDevices, &backends(&inj, &audio));
         assert_eq!(s.held_count(), 1, "the held key must survive a query");
+    }
+
+    /// A peer session allowed exactly `permissions`, already authenticated.
+    fn peer_with(permissions: Permissions) -> Session {
+        Session::for_authenticated_peer(permissions)
+    }
+
+    #[test]
+    fn a_peer_without_control_input_cannot_move_the_pointer() {
+        let mut s = peer_with(Permissions {
+            control_input: false,
+            read_devices: true,
+            list_windows: true,
+        });
+        let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
+
+        let r = s.handle(
+            IpcRequest::InjectMouseMove {
+                screen_x: 10,
+                screen_y: 10,
+                virtual_screen: VirtualScreenDto {
+                    left: 0,
+                    top: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            },
+            &backends(&inj, &audio),
+        );
+        match r {
+            IpcResponse::Error { code, message } => {
+                assert_eq!(code, "not_permitted");
+                assert!(message.contains("control-input"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            inj.events.borrow().is_empty(),
+            "a refused request must not reach the injector at all"
+        );
+    }
+
+    #[test]
+    fn a_peer_without_read_devices_cannot_list_them() {
+        let mut s = peer_with(Permissions {
+            control_input: true,
+            read_devices: false,
+            list_windows: true,
+        });
+        let inj = MockInjector::default();
+        let audio = MockAudio(Ok(vec![a_device(ultidesk_core::DeviceId::new(), "spk")]));
+
+        let r = s.handle(IpcRequest::ListAudioDevices, &backends(&inj, &audio));
+        assert!(
+            matches!(r, IpcResponse::Error { ref code, .. } if code == "not_permitted"),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn a_peer_without_list_windows_cannot_read_titles() {
+        // The one that leaks what the operator is doing, and the reason it is a separate
+        // permission from reading devices.
+        let mut s = peer_with(Permissions::on_pairing());
+        let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
+
+        let r = s.handle(IpcRequest::EnumerateWindows, &backends(&inj, &audio));
+        assert!(
+            matches!(r, IpcResponse::Error { ref code, .. } if code == "not_permitted"),
+            "a fresh pairing must not hand over window titles: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_peer_allowed_nothing_can_still_be_pinged() {
+        // Liveness is not a capability. Refusing it would make "the peer is gone" and
+        // "the peer denies me" indistinguishable.
+        let mut s = peer_with(Permissions::default());
+        let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
+        assert!(matches!(
+            s.handle(IpcRequest::Ping, &backends(&inj, &audio)),
+            IpcResponse::Pong
+        ));
+    }
+
+    #[test]
+    fn a_peer_can_always_let_go_of_a_key_it_is_holding() {
+        // Release is deliberately ungated. It only undoes what this session already did,
+        // and a peer whose input permission is revoked mid-connection must still be able
+        // to drop a held modifier — otherwise revoking a permission is what leaves the
+        // machine with a stuck key.
+        let mut s = peer_with(Permissions::all());
+        let inj = MockInjector::default();
+        let audio = MockAudio(Ok(Vec::new()));
+        s.handle(
+            IpcRequest::InjectKey {
+                scancode: 0x1D,
+                down: true,
+            },
+            &backends(&inj, &audio),
+        );
+        assert_eq!(s.held_count(), 1);
+
+        // Revoke on the live session, holding the key it already pressed.
+        s.permissions = Permissions::default();
+
+        let r = s.handle(IpcRequest::ReleaseAllInput, &backends(&inj, &audio));
+        assert!(matches!(r, IpcResponse::Released { count: 1 }), "{r:?}");
+        assert_eq!(s.held_count(), 0);
+    }
+
+    #[test]
+    fn the_local_ipc_is_allowed_everything() {
+        // The token holder is a process running as this user on this machine; it could
+        // drive the same APIs directly. Gating it would be theatre.
+        let (mut s, inj, _) = authed();
+        let audio = MockAudio(Ok(Vec::new()));
+        assert!(!matches!(
+            s.handle(IpcRequest::EnumerateWindows, &backends(&inj, &audio)),
+            IpcResponse::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn every_request_has_a_decided_permission() {
+        // `required_permission` has no wildcard arm, so this is really a reminder of why:
+        // adding a request must not silently inherit "needs nothing".
+        let ungated = [
+            IpcRequest::Ping,
+            IpcRequest::ReleaseAllInput,
+            IpcRequest::Hello {
+                token: String::new(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        ];
+        for req in ungated {
+            assert!(
+                required_permission(&req).is_none(),
+                "{req:?} should need no permission"
+            );
+        }
+        assert_eq!(
+            required_permission(&IpcRequest::ListAudioDevices),
+            Some(Needed::ReadDevices)
+        );
+        assert_eq!(
+            required_permission(&IpcRequest::EnumerateWindows),
+            Some(Needed::ListWindows)
+        );
+        assert_eq!(
+            required_permission(&IpcRequest::InjectScroll {
+                delta_x: 0,
+                delta_y: 120
+            }),
+            Some(Needed::ControlInput)
+        );
     }
 
     #[test]

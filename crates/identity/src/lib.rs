@@ -37,6 +37,6 @@ pub mod store;
 mod test_support;
 
 pub use key::{Identity, PeerKey};
-pub use peers::{PairedPeer, PeerStore, PinError, PinOutcome};
+pub use peers::{PairedPeer, PeerStore, Permissions, PinError, PinOutcome, UnknownPermission};
 pub use sas::pairing_code;
 pub use store::{load_or_create, IdentityError, LoadedIdentity};
