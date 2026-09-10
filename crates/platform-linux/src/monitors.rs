@@ -275,17 +275,13 @@ mod imp {
             match event {
                 // Only the *current* mode matters; a compositor lists every supported one.
                 wl_output::Event::Mode {
-                    flags,
+                    flags: wayland_client::WEnum::Value(flags),
                     width,
                     height,
                     refresh,
-                } => {
-                    if let wayland_client::WEnum::Value(f) = flags {
-                        if f.contains(wl_output::Mode::Current) {
-                            entry.mode = Some((width, height));
-                            entry.refresh_mhz = Some(refresh);
-                        }
-                    }
+                } if flags.contains(wl_output::Mode::Current) => {
+                    entry.mode = Some((width, height));
+                    entry.refresh_mhz = Some(refresh);
                 }
                 wl_output::Event::Scale { factor } => entry.scale = Some(factor),
                 _ => {}
