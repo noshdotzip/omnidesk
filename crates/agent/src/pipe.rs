@@ -81,7 +81,7 @@ async fn handle_connection(
             continue;
         }
         let response = match serde_json::from_str::<IpcRequest>(trimmed) {
-            Ok(req) => session.handle(req, &backends.borrow()),
+            Ok(req) => crate::ipc::complete(&mut session, req, backends).await,
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),
@@ -170,6 +170,7 @@ mod tests {
             injector: Arc::new(NoopInjector),
             audio: Arc::new(NoAudio),
             monitors: Arc::new(NoMonitors),
+            relay: None,
         });
 
         let srv_name = name.clone();

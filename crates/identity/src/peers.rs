@@ -181,6 +181,19 @@ pub struct PairedPeer {
     /// What this machine lets the peer do. Absent in a v1 file; see [`PEERS_VERSION`].
     #[serde(default)]
     pub permissions: Permissions,
+    /// Where this peer was last reached, as `host:port`.
+    ///
+    /// A **hint**, never an identity. Discovery does not exist yet, so without somewhere
+    /// to remember the address every connection would need it typed in again; but an
+    /// address can be taken over by another machine, and the only thing that decides
+    /// whether a connection is this peer is the key. Nothing here compares addresses.
+    ///
+    /// Absent in a file written before it was recorded, and absent for a peer that has
+    /// never been reached. That absence has no security meaning, which is why it needed
+    /// no schema bump — unlike [`Permissions`], where a missing field had to be read as
+    /// "granted nothing".
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -269,8 +282,45 @@ impl PeerStore {
             name: name.to_string(),
             paired_at_unix: now_unix,
             permissions: Permissions::on_pairing(),
+            address: None,
         });
         Ok(PinOutcome::Added)
+    }
+
+    /// Remember where a peer was last reached.
+    ///
+    /// Returns whether anything changed, so a caller can save only when it did rather
+    /// than rewriting the file after every connection.
+    ///
+    /// Recording it for an unpaired key is refused silently by doing nothing: an address
+    /// is only meaningful attached to a device this machine trusts, and creating an entry
+    /// here would be creating trust.
+    pub fn remember_address(&mut self, key: &PeerKey, address: &str) -> bool {
+        let Some(peer) = self.peers.iter_mut().find(|p| &p.key == key) else {
+            return false;
+        };
+        if peer.address.as_deref() == Some(address) {
+            return false;
+        }
+        peer.address = Some(address.to_string());
+        true
+    }
+
+    /// Where a peer was last reached, if anywhere.
+    pub fn address(&self, key: &PeerKey) -> Option<&str> {
+        self.get(key).and_then(|p| p.address.as_deref())
+    }
+
+    /// The single peer this machine trusts, when there is exactly one.
+    ///
+    /// A convenience for the common two-machine desk, and deliberately `None` when there
+    /// are several: guessing which peer was meant is the kind of thing that silently
+    /// sends input to the wrong machine.
+    pub fn only_peer(&self) -> Option<&PairedPeer> {
+        match self.peers.as_slice() {
+            [one] => Some(one),
+            _ => None,
+        }
     }
 
     /// What a peer is allowed to do, or nothing at all if it is not paired.
@@ -701,6 +751,83 @@ mod tests {
         let p = loaded.store.permissions(&peer);
         assert!(p.read_devices, "the ones it does know still apply");
         assert_eq!(p.granted(), vec!["read-devices"]);
+    }
+
+    #[test]
+    fn an_address_is_remembered_and_updated_but_only_for_a_paired_peer() {
+        let (local, peer, stranger) = keys();
+        let mut store = PeerStore::new(local);
+        store.pin(peer, "arch", 1).unwrap();
+
+        assert_eq!(
+            store.address(&peer),
+            None,
+            "nothing is known before a connection"
+        );
+        assert!(store.remember_address(&peer, "192.168.137.9:45872"));
+        assert_eq!(store.address(&peer), Some("192.168.137.9:45872"));
+
+        assert!(
+            !store.remember_address(&peer, "192.168.137.9:45872"),
+            "an unchanged address must not make the caller rewrite the file"
+        );
+        assert!(
+            store.remember_address(&peer, "10.0.0.5:45872"),
+            "a move is recorded"
+        );
+
+        assert!(
+            !store.remember_address(&stranger, "10.0.0.9:45872"),
+            "an address for an unpaired key would be creating trust"
+        );
+        assert!(!store.trusts(&stranger));
+    }
+
+    #[test]
+    fn the_only_peer_is_only_returned_when_there_is_exactly_one() {
+        // Guessing which of several peers was meant is how input reaches the wrong
+        // machine.
+        let (local, a, b) = keys();
+        let mut store = PeerStore::new(local);
+        assert!(store.only_peer().is_none(), "none paired");
+
+        store.pin(a, "arch", 1).unwrap();
+        assert_eq!(store.only_peer().map(|p| p.key), Some(a));
+
+        store.pin(b, "surface", 2).unwrap();
+        assert!(store.only_peer().is_none(), "ambiguous");
+    }
+
+    #[test]
+    fn an_address_survives_the_file() {
+        let d = TempDir::new("peer-address");
+        let (local, peer, _) = keys();
+        let mut store = PeerStore::new(local);
+        store.pin(peer, "arch", 1).unwrap();
+        store.remember_address(&peer, "192.168.137.9:45872");
+        store.save(d.path()).unwrap();
+
+        let loaded = load(d.path(), local);
+        assert_eq!(loaded.store.address(&peer), Some("192.168.137.9:45872"));
+        assert!(loaded.note.is_none(), "adding a field is not a migration");
+    }
+
+    #[test]
+    fn a_file_without_an_address_field_is_read_without_complaint() {
+        // Unlike a missing permission, a missing address has no security meaning — which
+        // is why adding it needed no schema bump.
+        let d = TempDir::new("peer-no-address");
+        let (local, peer, _) = keys();
+        let raw = format!(
+            r#"{{"version":2,"peers":[{{"key":"{peer}","name":"arch","paired_at_unix":7,
+               "permissions":{{"control_input":true}}}}]}}"#
+        );
+        std::fs::write(d.path().join(PEERS_FILE), raw).unwrap();
+
+        let loaded = load(d.path(), local);
+        assert!(loaded.store.trusts(&peer));
+        assert_eq!(loaded.store.address(&peer), None);
+        assert!(loaded.note.is_none());
     }
 
     #[test]

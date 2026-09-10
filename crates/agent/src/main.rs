@@ -29,6 +29,9 @@
 //!   ultidesk-agent monitors    Print this machine's monitors as JSON. Needs no window
 //!                              and raises no permission dialog.
 //!   ultidesk-agent peer-monitors Print a paired peer's monitors, with the same check.
+//!   ultidesk-agent ask-peer    Ask this machine's agent to put a question to a peer —
+//!                              the path the control app takes.
+//!                              ask-peer <monitors|devices> [peer key]
 //!   ultidesk-agent uinput-test Move the pointer through a square using virtual
 //!                              input devices. Linux only. Raises NO permission
 //!                              dialog and DOES move the real cursor.
@@ -54,6 +57,7 @@ mod pipe;
 #[cfg(target_os = "linux")]
 mod portal_injector;
 mod quic;
+mod relay;
 mod tcp;
 #[cfg(target_os = "linux")]
 mod uinput_injector;
@@ -86,6 +90,7 @@ fn main() -> Result<()> {
         "peer-devices" => peer_devices(),
         "monitors" => monitors(),
         "peer-monitors" => peer_monitors(),
+        "ask-peer" => ask_peer(),
         "pair" => pair(),
         "peers" => peers(),
         "kvm-demo" => kvm_demo(),
@@ -101,7 +106,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|monitors|peer-monitors|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|monitors|peer-monitors|ask-peer|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -591,6 +596,7 @@ fn peer_monitors() -> Result<()> {
         .enable_all()
         .build()?;
     let monitors = rt.block_on(quic::peer_monitors(&identity, &store, addr))?;
+    remember_where(&dir, store, &monitors[..], addr)?;
     println!("{}", serde_json::to_string_pretty(&monitors)?);
     tracing::info!(count = monitors.len(), "read a peer's monitors");
     Ok(())
@@ -622,8 +628,116 @@ fn peer_devices() -> Result<()> {
         .enable_all()
         .build()?;
     let devices = rt.block_on(quic::peer_audio_devices(&identity, &store, addr))?;
+    remember_where(&dir, store, &devices[..], addr)?;
     println!("{}", serde_json::to_string_pretty(&devices)?);
     tracing::info!(count = devices.len(), "read a peer's audio endpoints");
+    Ok(())
+}
+
+/// Note where a peer was reached, so the relay can find it again without being told.
+///
+/// The answer's own labels identify the peer: every item carries the device id of the
+/// machine that sent it, and that id was already checked against the key the handshake
+/// proved. So this cannot attach an address to the wrong entry — it looks up the peer by
+/// the id in the data it just verified.
+fn remember_where<T>(
+    dir: &std::path::Path,
+    mut store: ultidesk_identity::PeerStore,
+    answered: &[T],
+    addr: std::net::SocketAddr,
+) -> Result<()>
+where
+    T: OwnedItem,
+{
+    let Some(owner) = answered.first().map(OwnedItem::owner) else {
+        // Nothing came back, so nothing identifies the peer. Not an error: a machine
+        // really can have no endpoints.
+        return Ok(());
+    };
+    let Some(key) = store
+        .peers()
+        .iter()
+        .find(|p| p.key.device_id() == owner)
+        .map(|p| p.key)
+    else {
+        return Ok(());
+    };
+    if store.remember_address(&key, &addr.to_string()) {
+        store.save(dir)?;
+    }
+    Ok(())
+}
+
+/// Something a peer answered with, carrying the device that owns it.
+trait OwnedItem {
+    fn owner(&self) -> ultidesk_core::DeviceId;
+}
+impl OwnedItem for ultidesk_topology::AudioDevice {
+    fn owner(&self) -> ultidesk_core::DeviceId {
+        self.device_id
+    }
+}
+impl OwnedItem for ultidesk_topology::Monitor {
+    fn owner(&self) -> ultidesk_core::DeviceId {
+        self.device_id
+    }
+}
+
+/// Ask this machine's own agent to put a question to a peer.
+///
+/// The path the control app will take: it speaks only to its local agent, and the agent
+/// holds the peer connection. This subcommand exists to exercise that path end to end
+/// before there is a GUI on it.
+fn ask_peer() -> Result<()> {
+    let query = match std::env::args().nth(2).as_deref() {
+        Some("monitors") => ipc::PeerQuery::Monitors,
+        Some("devices") => ipc::PeerQuery::AudioDevices,
+        _ => anyhow::bail!("usage: ultidesk-agent ask-peer <monitors|devices> [peer key]"),
+    };
+
+    let (dir, identity) = local_identity()?;
+    let store = load_peers(&dir, identity.public())?;
+    let peer = match std::env::args().nth(3) {
+        Some(text) => ultidesk_identity::PeerKey::parse(&text)
+            .ok_or_else(|| anyhow::anyhow!("not a public key; pass the value `peers` prints"))?,
+        // Convenient for the two-machine desk, and refused rather than guessed at when
+        // there is more than one: sending a question to the wrong machine is the kind of
+        // mistake that is hard to notice.
+        None => {
+            store
+                .only_peer()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "several peers are paired, so name which one: ask-peer <query> <key>"
+                    )
+                })?
+                .key
+        }
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let response = rt.block_on(async {
+        let relay = std::sync::Arc::new(relay::RelayContext::new(
+            std::sync::Arc::new(identity),
+            store,
+        ));
+        relay.ask(peer, query).await
+    });
+
+    match response {
+        ipc::IpcResponse::PeerMonitors { peer, monitors } => {
+            eprintln!("from {}", peer.fingerprint());
+            println!("{}", serde_json::to_string_pretty(&monitors)?);
+        }
+        ipc::IpcResponse::PeerAudioDevices { peer, devices } => {
+            eprintln!("from {}", peer.fingerprint());
+            println!("{}", serde_json::to_string_pretty(&devices)?);
+        }
+        ipc::IpcResponse::Error { code, message } => anyhow::bail!("{code}: {message}"),
+        other => anyhow::bail!("unexpected answer: {other:?}"),
+    }
     Ok(())
 }
 
@@ -671,6 +785,12 @@ fn pair() -> Result<()> {
     let outcome = store
         .pin(paired.key, &name, ultidesk_identity::peers::now_unix())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Only the dialling side learns an address here; the listening side saw a source
+    // port that will not be there next time, and recording it would be worse than
+    // recording nothing.
+    if let Some(addr) = &target {
+        store.remember_address(&paired.key, addr);
+    }
     store.save(&dir)?;
 
     match outcome {
@@ -1279,13 +1399,18 @@ fn audio_recv() -> Result<()> {
 fn serve() -> Result<()> {
     use std::sync::Arc;
     let ep = endpoint::Endpoint::generate();
-    let (_dir, identity) = local_identity()?;
+    let (dir, identity) = local_identity()?;
     // Every endpoint this agent reports is labelled with the machine's derived id, so a
     // client can check the answer against the identity it authenticated.
-    let backends = Arc::new(ipc::LocalBackends::new(
-        Arc::new(ipc::RealInjector),
-        identity.device_id(),
-    ));
+    // The local IPC may reach peers on a caller's behalf; the peer-facing transports
+    // below are built without a relay, so they have nothing to hop with.
+    let device_id = identity.device_id();
+    let store = load_peers(&dir, identity.public())?;
+    let backends = Arc::new(
+        ipc::LocalBackends::new(Arc::new(ipc::RealInjector), device_id).with_relay(Arc::new(
+            relay::RelayContext::new(Arc::new(identity), store),
+        )),
+    );
     let path = endpoint::write_handshake(&ep)?;
     // The pipe name is fine to log; the token is NOT logged.
     tracing::info!(pipe = %ep.endpoint_path, handshake = %path.display(), "agent IPC listening");
@@ -1312,13 +1437,18 @@ fn serve() -> Result<()> {
 fn serve() -> Result<()> {
     use std::sync::Arc;
     let ep = endpoint::Endpoint::generate();
-    let (_dir, identity) = local_identity()?;
+    let (dir, identity) = local_identity()?;
     // Every endpoint this agent reports is labelled with the machine's derived id, so a
     // client can check the answer against the identity it authenticated.
-    let backends = Arc::new(ipc::LocalBackends::new(
-        Arc::new(ipc::RealInjector),
-        identity.device_id(),
-    ));
+    // The local IPC may reach peers on a caller's behalf; the peer-facing transports
+    // below are built without a relay, so they have nothing to hop with.
+    let device_id = identity.device_id();
+    let store = load_peers(&dir, identity.public())?;
+    let backends = Arc::new(
+        ipc::LocalBackends::new(Arc::new(ipc::RealInjector), device_id).with_relay(Arc::new(
+            relay::RelayContext::new(Arc::new(identity), store),
+        )),
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

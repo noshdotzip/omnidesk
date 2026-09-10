@@ -141,7 +141,7 @@ async fn pump(
 ) -> anyhow::Result<()> {
     while let Some(payload) = stream.recv().await? {
         let response = match serde_json::from_slice::<IpcRequest>(&payload) {
-            Ok(req) => session.handle(req, &backends.borrow()),
+            Ok(req) => crate::ipc::complete(session, req, backends).await,
             Err(e) => IpcResponse::Error {
                 code: "bad_request".into(),
                 message: format!("invalid request json: {e}"),
