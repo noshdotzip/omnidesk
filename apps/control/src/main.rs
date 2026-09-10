@@ -18,6 +18,7 @@
 //! the second protocol ADR-0004 warns against. The UI says which parts are real rather
 //! than showing plausible placeholders.
 
+mod agent;
 mod devices;
 mod monitors;
 mod settings;
@@ -63,6 +64,12 @@ fn main() {
 struct Machines {
     local: DeviceId,
     remote: DeviceId,
+    /// The paired peer to ask the agent about, when exactly one is paired.
+    ///
+    /// `None` when none is paired *or* when several are: picking one to show would be
+    /// guessing which machine the operator meant, and the editor would then silently
+    /// arrange the wrong one.
+    peer: Option<(ultidesk_identity::PeerKey, String)>,
 }
 
 /// Everything loaded from disk once, and shared by both tabs through context.
@@ -128,10 +135,25 @@ impl Session {
             None => {}
         }
 
+        // Which peer to ask about. Read from the same store the agent enforces against,
+        // so the app cannot show a device the agent would refuse to talk to.
+        let peer = dir.as_ref().and_then(|d| {
+            let local_key = ultidesk_identity::store::load(d).ok().flatten()?.public();
+            let store = ultidesk_identity::peers::load(d, local_key).store;
+            store.only_peer().map(|p| (p.key, p.name.clone()))
+        });
+
         let session = Session {
             machines: Machines {
                 local: loaded.settings.local_device_id,
-                remote: DeviceId::new(),
+                // The peer's *derived* id when one is paired, so the monitors and audio
+                // endpoints it reports line up with the machine shown in the editor. A
+                // random id would put its real devices under a machine nobody has.
+                remote: peer
+                    .as_ref()
+                    .map(|(key, _)| key.device_id())
+                    .unwrap_or_else(DeviceId::new),
+                peer,
             },
             dir,
             fingerprint,
@@ -172,6 +194,100 @@ fn peer_placeholder(device_id: DeviceId) -> Monitor {
         rotation: Rotation::Landscape,
         refresh_rate: None,
         primary: false,
+    }
+}
+
+/// The arrangement to show before the agent has answered — or if it never does.
+///
+/// Read through the window toolkit, which is the only source available without an agent.
+/// It is deliberately the *fallback* now rather than the source: the agent's numbers are
+/// what a peer is told, so they are the ones the editor should arrange, and having one
+/// source is what stops the two disagreeing again.
+fn initial_layout(
+    window: &dioxus::desktop::tao::window::Window,
+    machines: &Machines,
+    stored: &settings::Settings,
+) -> Layout {
+    let found = monitors::local_monitors(window, machines.local);
+    if found.is_empty() {
+        // A headless or unreadable session. Falling back keeps the editor usable and,
+        // because the names differ, makes it obvious these are not real.
+        return demo_layout(machines);
+    }
+    arrange(
+        machines,
+        found,
+        vec![peer_placeholder(machines.remote)],
+        stored,
+    )
+}
+
+/// The arrangement built from what the agent reported.
+///
+/// `None` when the agent could not say what this machine's screens are — in which case
+/// whatever is already on screen is better than an empty editor.
+fn layout_from_agent(
+    machines: &Machines,
+    view: &agent::AgentView,
+    stored: &settings::Settings,
+) -> Option<Layout> {
+    let local = view.local_monitors.value.clone()?;
+    if local.is_empty() {
+        return None;
+    }
+    // A peer that could not be reached keeps its placeholder rather than vanishing: the
+    // operator arranged it, and removing it would silently drop that arrangement.
+    let peer = view
+        .peer
+        .as_ref()
+        .and_then(|p| p.monitors.value.clone())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| vec![peer_placeholder(machines.remote)]);
+    Some(arrange(machines, local, peer, stored))
+}
+
+/// Place two machines' screens and restore anything the operator saved.
+fn arrange(
+    machines: &Machines,
+    local: Vec<Monitor>,
+    peer: Vec<Monitor>,
+    stored: &settings::Settings,
+) -> Layout {
+    // Machines in a strip, left to right, in the order they connected. `left_to_right`
+    // translates each machine's desktop as one block, so every screen keeps its exact
+    // position relative to its own machine's others — which is what stops a shared
+    // internal boundary becoming a gap the pointer cannot cross. See
+    // `ultidesk_topology::arrange`.
+    let arranged = ultidesk_topology::left_to_right(vec![
+        ultidesk_topology::MachineMonitors {
+            device_id: machines.local,
+            monitors: local,
+        },
+        ultidesk_topology::MachineMonitors {
+            device_id: machines.remote,
+            monitors: peer,
+        },
+    ]);
+    // Saved positions are applied last, so anything the operator arranged wins over both
+    // the platform's idea of where the screens are and the default strip.
+    stored.layout.apply(arranged.monitors)
+}
+
+/// What to tell the operator about where these numbers came from.
+fn describe_view(view: &agent::AgentView) -> Option<String> {
+    if let Some(note) = &view.note {
+        return Some(note.clone());
+    }
+    if let Some(note) = &view.local_monitors.note {
+        return Some(format!("this machine's screens: {note}"));
+    }
+    match &view.peer {
+        Some(peer) => peer
+            .monitors
+            .note
+            .as_ref()
+            .map(|note| format!("{}: {note}", peer.name)),
+        None => Some("no peer is paired, so the second screen is a placeholder".into()),
     }
 }
 
@@ -268,6 +384,17 @@ fn App() -> Element {
             if let Some(fingerprint) = &session.fingerprint {
                 div { class: "note", "This machine's identity: {fingerprint}" }
             }
+            // The paired peer, by the fingerprint the operator compared when pairing —
+            // so the two machines on screen can be told apart by the same string that
+            // established they were the right two.
+            match &session.machines.peer {
+                Some((key, name)) => rsx! {
+                    div { class: "note", "Paired with {name}: {key.fingerprint()}" }
+                },
+                None => rsx! {
+                    div { class: "note", "No peer paired — run `ultidesk-agent pair`" }
+                },
+            }
             div { class: "tabs",
                 button {
                     class: if *tab.read() == Tab::Displays { "tab on" } else { "tab" },
@@ -294,34 +421,33 @@ fn Displays() -> Element {
     let stored = use_context::<std::rc::Rc<std::cell::RefCell<settings::Settings>>>();
     let machines = session.machines.clone();
     let window = dioxus::desktop::use_window();
-    // Real monitors, read once on mount. They do not change while the editor is open
-    // often enough to justify watching for hotplug before the settings IPC exists.
-    let mut layout = use_signal(|| {
-        let mut found = monitors::local_monitors(&window, machines.local);
-        if found.is_empty() {
-            // A headless or unreadable session. Falling back keeps the editor usable
-            // and, because the names differ, makes it obvious these are not real.
-            return demo_layout(&machines);
-        }
-        // The starting arrangement: machines in a strip, left to right, in the order
-        // they connected. `left_to_right` translates each machine's desktop as one
-        // block, so every screen keeps its exact position relative to its own machine's
-        // others — which is what stops a shared internal boundary becoming a gap the
-        // pointer cannot cross. See `ultidesk_topology::arrange`.
-        let arranged = ultidesk_topology::left_to_right(vec![
-            ultidesk_topology::MachineMonitors {
-                device_id: machines.local,
-                monitors: std::mem::take(&mut found),
-            },
-            ultidesk_topology::MachineMonitors {
-                device_id: machines.remote,
-                monitors: vec![peer_placeholder(machines.remote)],
-            },
-        ]);
-        // Saved positions are applied last, so anything the operator arranged wins over
-        // both the platform's idea of where the screens are and the default strip.
-        stored.borrow().layout.apply(arranged.monitors)
+
+    // What the agent says, fetched once on mount. `use_resource` rather than a blocking
+    // read because one of these questions is a *relay* to the other machine, and a panel
+    // that freezes while a sleeping peer times out looks exactly like a crash.
+    let asked = machines.peer.clone();
+    let view = use_resource(move || {
+        let asked = asked.clone();
+        async move { std::rc::Rc::new(agent::fetch(asked).await) }
     });
+
+    // The layout is a signal so dragging can move it; it is (re)built from the agent's
+    // answer as soon as one arrives, and from the toolkit until then.
+    let mut layout = use_signal(|| initial_layout(&window, &machines, &stored.borrow()));
+    let mut agent_note = use_signal(|| None::<String>);
+    let mut built = use_signal(|| false);
+
+    // Rebuild once, when the first answer lands. Rebuilding on every render would throw
+    // away whatever the operator had just dragged.
+    if let Some(answer) = view.read().as_ref() {
+        if !built() {
+            built.set(true);
+            agent_note.set(describe_view(answer));
+            if let Some(fresh) = layout_from_agent(&machines, answer, &stored.borrow()) {
+                layout.set(fresh);
+            }
+        }
+    }
     let mut dragging = use_signal(|| None::<(usize, f64, f64)>);
     let mut save_error = use_signal(|| None::<String>);
 
@@ -465,11 +591,48 @@ struct AudioState {
 }
 
 impl AudioState {
+    /// The panel as it looks before the agent has answered, or with no agent at all.
     fn load(machines_ids: &Machines, saved_routes: &[Route]) -> Self {
         let machines = vec![
             devices::local(machines_ids.local, "This machine"),
             devices::remote_placeholder(machines_ids.remote, "Peer"),
         ];
+        Self::from_machines(machines, saved_routes)
+    }
+
+    /// The panel built from what the agent reported, including the peer's real devices.
+    ///
+    /// Each half falls back independently: a peer that could not be reached leaves its
+    /// side a labelled placeholder while this machine's endpoints stay real, which is a
+    /// more useful screen than an empty one and an honest one either way.
+    fn from_agent(
+        machines_ids: &Machines,
+        view: &agent::AgentView,
+        saved_routes: &[Route],
+    ) -> Self {
+        let local = match view.local_audio.value.clone() {
+            Some(devices) => devices::from_agent(machines_ids.local, "This machine", devices),
+            None => devices::local(machines_ids.local, "This machine"),
+        };
+        let peer = match (
+            &view.peer,
+            view.peer.as_ref().and_then(|p| p.audio.value.clone()),
+        ) {
+            (Some(p), Some(devices)) => devices::from_agent(machines_ids.remote, &p.name, devices),
+            (Some(p), None) => {
+                let note = p
+                    .audio
+                    .note
+                    .clone()
+                    .unwrap_or_else(|| "the peer did not answer".into());
+                devices::unreachable(machines_ids.remote, &p.name, note)
+            }
+            (None, _) => devices::remote_placeholder(machines_ids.remote, "Peer"),
+        };
+        Self::from_machines(vec![local, peer], saved_routes)
+    }
+
+    fn from_machines(machines: Vec<MachineAudio>, saved_routes: &[Route]) -> Self {
         let all = machines.iter().flat_map(|m| m.devices.clone()).collect();
         let mut routing = AudioRouting::new(all);
         // Re-checked on the way in rather than trusted. A device may be gone, or the
@@ -507,6 +670,23 @@ fn AudioPanel() -> Element {
         let saved = stored.borrow().audio_routes.clone();
         AudioState::load(&session.machines, &saved)
     });
+
+    // The same fetch the Displays tab does, over its own connection: the tabs mount
+    // independently and sharing one would mean the second tab showed whatever the first
+    // happened to have asked for.
+    let asked = session.machines.peer.clone();
+    let view = use_resource(move || {
+        let asked = asked.clone();
+        async move { std::rc::Rc::new(agent::fetch(asked).await) }
+    });
+    let mut built = use_signal(|| false);
+    if let Some(answer) = view.read().as_ref() {
+        if !built() {
+            built.set(true);
+            let saved = stored.borrow().audio_routes.clone();
+            state.set(AudioState::from_agent(&session.machines, answer, &saved));
+        }
+    }
     let mut source = use_signal(|| None::<DeviceKey>);
     let mut sink = use_signal(|| None::<DeviceKey>);
     let mut message = use_signal(String::new);

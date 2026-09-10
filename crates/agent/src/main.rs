@@ -29,8 +29,10 @@
 //!   ultidesk-agent monitors    Print this machine's monitors as JSON. Needs no window
 //!                              and raises no permission dialog.
 //!   ultidesk-agent peer-monitors Print a paired peer's monitors, with the same check.
-//!   ultidesk-agent ask-peer    Ask this machine's agent to put a question to a peer —
-//!                              the path the control app takes.
+//!   ultidesk-agent ask         Ask this machine's *running* agent over the local IPC,
+//!                              exactly as the control app does.
+//!                              ask <monitors|devices>
+//!   ultidesk-agent ask-peer    The same, but relayed to a paired peer.
 //!                              ask-peer <monitors|devices> [peer key]
 //!   ultidesk-agent uinput-test Move the pointer through a square using virtual
 //!                              input devices. Linux only. Raises NO permission
@@ -47,7 +49,6 @@
 //!                              DOES prompt for permission and DOES move the cursor.
 
 mod audio;
-mod endpoint;
 mod forward;
 #[cfg(windows)]
 mod handoff;
@@ -90,7 +91,8 @@ fn main() -> Result<()> {
         "peer-devices" => peer_devices(),
         "monitors" => monitors(),
         "peer-monitors" => peer_monitors(),
-        "ask-peer" => ask_peer(),
+        "ask" => ask(false),
+        "ask-peer" => ask(true),
         "pair" => pair(),
         "peers" => peers(),
         "kvm-demo" => kvm_demo(),
@@ -106,7 +108,7 @@ fn main() -> Result<()> {
         other => {
             eprintln!("unknown subcommand: {other}");
             eprintln!(
-                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|monitors|peer-monitors|ask-peer|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
+                "usage: ultidesk-agent [serve|enumerate|probe|identity|pair|peers|serve-peer|peer-ping|peer-devices|monitors|peer-monitors|ask|ask-peer|inject-test|capture-test|cast-test [start|pick]|serve-peer-dev|kvm-demo|kvm-mirror|kvm-handoff|kvm-source|uinput-test|input-devices|audio-devices|audio-send|audio-recv]"
             );
             std::process::exit(2);
         }
@@ -683,35 +685,36 @@ impl OwnedItem for ultidesk_topology::Monitor {
     }
 }
 
-/// Ask this machine's own agent to put a question to a peer.
+/// Ask this machine's running agent something, exactly as the control app does.
 ///
-/// The path the control app will take: it speaks only to its local agent, and the agent
-/// holds the peer connection. This subcommand exists to exercise that path end to end
-/// before there is a GUI on it.
-fn ask_peer() -> Result<()> {
-    let query = match std::env::args().nth(2).as_deref() {
+/// Goes through the local IPC rather than doing the work in this process. That is the
+/// point: it exercises the client, the transport, the gate and — for a peer question —
+/// the relay, which is the whole path the UI depends on. Doing it in-process would test
+/// none of them.
+///
+///     ask monitors | devices            about this machine
+///     ask-peer monitors | devices [key] about a paired peer
+fn ask(peer: bool) -> Result<()> {
+    let what = std::env::args().nth(2);
+    let query = match what.as_deref() {
         Some("monitors") => ipc::PeerQuery::Monitors,
         Some("devices") => ipc::PeerQuery::AudioDevices,
-        _ => anyhow::bail!("usage: ultidesk-agent ask-peer <monitors|devices> [peer key]"),
+        _ => anyhow::bail!(
+            "usage: ultidesk-agent {} <monitors|devices>{}",
+            if peer { "ask-peer" } else { "ask" },
+            if peer { " [peer key]" } else { "" }
+        ),
     };
 
-    let (dir, identity) = local_identity()?;
-    let store = load_peers(&dir, identity.public())?;
-    let peer = match std::env::args().nth(3) {
-        Some(text) => ultidesk_identity::PeerKey::parse(&text)
-            .ok_or_else(|| anyhow::anyhow!("not a public key; pass the value `peers` prints"))?,
-        // Convenient for the two-machine desk, and refused rather than guessed at when
-        // there is more than one: sending a question to the wrong machine is the kind of
-        // mistake that is hard to notice.
-        None => {
-            store
-                .only_peer()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "several peers are paired, so name which one: ask-peer <query> <key>"
-                    )
-                })?
-                .key
+    let request = if peer {
+        ipc::IpcRequest::AskPeer {
+            peer: which_peer()?,
+            query,
+        }
+    } else {
+        match query {
+            ipc::PeerQuery::Monitors => ipc::IpcRequest::ListMonitors,
+            ipc::PeerQuery::AudioDevices => ipc::IpcRequest::ListAudioDevices,
         }
     };
 
@@ -719,14 +722,17 @@ fn ask_peer() -> Result<()> {
         .enable_all()
         .build()?;
     let response = rt.block_on(async {
-        let relay = std::sync::Arc::new(relay::RelayContext::new(
-            std::sync::Arc::new(identity),
-            store,
-        ));
-        relay.ask(peer, query).await
-    });
+        let mut client = ultidesk_ipc::Client::connect().await?;
+        client.request(request).await
+    })?;
 
     match response {
+        ipc::IpcResponse::Monitors { monitors } => {
+            println!("{}", serde_json::to_string_pretty(&monitors)?)
+        }
+        ipc::IpcResponse::AudioDevices { devices } => {
+            println!("{}", serde_json::to_string_pretty(&devices)?)
+        }
         ipc::IpcResponse::PeerMonitors { peer, monitors } => {
             eprintln!("from {}", peer.fingerprint());
             println!("{}", serde_json::to_string_pretty(&monitors)?);
@@ -735,10 +741,27 @@ fn ask_peer() -> Result<()> {
             eprintln!("from {}", peer.fingerprint());
             println!("{}", serde_json::to_string_pretty(&devices)?);
         }
-        ipc::IpcResponse::Error { code, message } => anyhow::bail!("{code}: {message}"),
         other => anyhow::bail!("unexpected answer: {other:?}"),
     }
     Ok(())
+}
+
+/// The peer named on the command line, or the only one paired.
+fn which_peer() -> Result<ultidesk_identity::PeerKey> {
+    if let Some(text) = std::env::args().nth(3) {
+        return ultidesk_identity::PeerKey::parse(&text)
+            .ok_or_else(|| anyhow::anyhow!("not a public key; pass the value `peers` prints"));
+    }
+    let (dir, identity) = local_identity()?;
+    let store = load_peers(&dir, identity.public())?;
+    // Convenient for the two-machine desk, and refused rather than guessed at when there
+    // is more than one: sending a question to the wrong machine is hard to notice.
+    Ok(store
+        .only_peer()
+        .ok_or_else(|| {
+            anyhow::anyhow!("several peers are paired, so name which one: ask-peer <query> <key>")
+        })?
+        .key)
 }
 
 /// Pair with another machine: establish a channel, compare a code, pin the key.
@@ -1401,7 +1424,7 @@ fn audio_recv() -> Result<()> {
 #[cfg(windows)]
 fn serve() -> Result<()> {
     use std::sync::Arc;
-    let ep = endpoint::Endpoint::generate();
+    let ep = ultidesk_ipc::Endpoint::generate();
     let (dir, identity) = local_identity()?;
     // Every endpoint this agent reports is labelled with the machine's derived id, so a
     // client can check the answer against the identity it authenticated.
@@ -1414,7 +1437,7 @@ fn serve() -> Result<()> {
             relay::RelayContext::new(Arc::new(identity), store),
         )),
     );
-    let path = endpoint::write_handshake(&ep)?;
+    let path = ultidesk_ipc::write_handshake(&ep)?;
     // The pipe name is fine to log; the token is NOT logged.
     tracing::info!(pipe = %ep.endpoint_path, handshake = %path.display(), "agent IPC listening");
     // Also print the handshake path to stdout so a launching parent can find it.
@@ -1439,7 +1462,7 @@ fn serve() -> Result<()> {
 #[cfg(unix)]
 fn serve() -> Result<()> {
     use std::sync::Arc;
-    let ep = endpoint::Endpoint::generate();
+    let ep = ultidesk_ipc::Endpoint::generate();
     let (dir, identity) = local_identity()?;
     // Every endpoint this agent reports is labelled with the machine's derived id, so a
     // client can check the answer against the identity it authenticated.
@@ -1462,7 +1485,7 @@ fn serve() -> Result<()> {
         // Written only once the socket is bound. A handshake file naming a socket that
         // does not exist sends the client to a dead path, and the failure then looks
         // like the agent crashed rather than like it never started.
-        let path = endpoint::write_handshake(&ep)?;
+        let path = ultidesk_ipc::write_handshake(&ep)?;
         // The socket path is fine to log; the token is NOT logged.
         tracing::info!(
             socket = %ep.endpoint_path,

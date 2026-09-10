@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ultidesk-core = { workspace = true }
 ultidesk-identity = { workspace = true }
+ultidesk-ipc = { workspace = true }
 ultidesk-topology = { workspace = true }
 ultidesk-transport = { workspace = true }
 ultidesk-platform-windows = { workspace = true }

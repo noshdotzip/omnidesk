@@ -47,17 +47,46 @@ pub fn local(device_id: DeviceId, label: &str) -> MachineAudio {
     }
 }
 
+/// A machine's endpoints as the agent reported them.
+///
+/// The agent is the source now, for both machines. For the peer it is the only possible
+/// source; for this machine it is the *right* one, because what the agent says is what a
+/// peer is told, and one source is what stops two from disagreeing.
+pub fn from_agent(device_id: DeviceId, label: &str, devices: Vec<AudioDevice>) -> MachineAudio {
+    let note = devices
+        .is_empty()
+        // Not an error: a machine really can have no active endpoints, and saying so
+        // beats an empty list that looks like a failure.
+        .then(|| "no active audio endpoints on this machine".to_string());
+    MachineAudio {
+        device_id,
+        label: label.to_string(),
+        devices,
+        note,
+    }
+}
+
+/// A paired machine that could not be reached just now.
+///
+/// Distinct from [`remote_placeholder`] on purpose: "not paired" and "paired but asleep"
+/// are different situations with different fixes, and an operator should not have to
+/// guess which one they are looking at.
+pub fn unreachable(device_id: DeviceId, label: &str, why: String) -> MachineAudio {
+    MachineAudio {
+        device_id,
+        label: label.to_string(),
+        devices: Vec::new(),
+        note: Some(why),
+    }
+}
+
 /// A stand-in for a machine whose devices we cannot read yet.
 pub fn remote_placeholder(device_id: DeviceId, label: &str) -> MachineAudio {
     MachineAudio {
         device_id,
         label: label.to_string(),
         devices: Vec::new(),
-        note: Some(
-            "not connected — a peer's devices arrive over the settings IPC, which is not \
-             implemented yet"
-                .into(),
-        ),
+        note: Some("no peer is paired with this machine yet".into()),
     }
 }
 

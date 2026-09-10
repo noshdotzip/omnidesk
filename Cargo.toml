@@ -9,6 +9,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/identity",
+    "crates/ipc",
     "crates/topology",
     "crates/platform-windows",
     "crates/platform-linux",
@@ -39,6 +40,7 @@ windows = "0.58"
 # Local crates
 ultidesk-core = { path = "crates/core" }
 ultidesk-identity = { path = "crates/identity" }
+ultidesk-ipc = { path = "crates/ipc" }
 ultidesk-transport = { path = "crates/transport" }
 ultidesk-topology = { path = "crates/topology" }
 ultidesk-platform-windows = { path = "crates/platform-windows" }

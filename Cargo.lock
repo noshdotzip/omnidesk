@@ -5379,6 +5379,7 @@ dependencies = [
  "tracing-subscriber",
  "ultidesk-core",
  "ultidesk-identity",
+ "ultidesk-ipc",
  "ultidesk-platform-linux",
  "ultidesk-platform-windows",
  "ultidesk-topology",
@@ -5393,8 +5394,10 @@ dependencies = [
  "dioxus",
  "serde",
  "serde_json",
+ "tokio",
  "ultidesk-core",
  "ultidesk-identity",
+ "ultidesk-ipc",
  "ultidesk-platform-linux",
  "ultidesk-platform-windows",
  "ultidesk-topology",
@@ -5421,6 +5424,22 @@ dependencies = [
  "sha2",
  "thiserror 2.0.19",
  "ultidesk-core",
+ "uuid",
+]
+
+[[package]]
+name = "ultidesk-ipc"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "ultidesk-core",
+ "ultidesk-identity",
+ "ultidesk-platform-windows",
+ "ultidesk-topology",
  "uuid",
 ]
 

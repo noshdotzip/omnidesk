@@ -16,9 +16,12 @@ path = "src/main.rs"
 dioxus = { version = "0.6", features = ["desktop"] }
 ultidesk-core = { workspace = true }
 ultidesk-identity = { workspace = true }
+ultidesk-ipc = { workspace = true }
 ultidesk-topology = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The agent client is async; the UI drives it through Dioxus resources.
+tokio = { version = "1", features = ["rt", "time"] }
 
 # Audio device enumeration is per-platform, so the control app links the same backends
 # the agent does rather than re-implementing enumeration against a second code path.

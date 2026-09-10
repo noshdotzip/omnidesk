@@ -81,6 +81,20 @@ pub fn handshake_path() -> PathBuf {
     runtime_dir().join("agent-endpoint.json")
 }
 
+/// Read the descriptor a running agent left behind.
+///
+/// A `NotFound` from here is the ordinary "no agent is running" case, and the caller is
+/// expected to say so rather than treat it as a fault.
+pub fn read_handshake(path: &std::path::Path) -> std::io::Result<Endpoint> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a handshake file: {e}", path.display()),
+        )
+    })
+}
+
 pub fn write_handshake(ep: &Endpoint) -> std::io::Result<PathBuf> {
     let path = handshake_path();
     let json = serde_json::to_string_pretty(ep)?;
