@@ -108,7 +108,22 @@ block's own width, no absolute position is ever compared across a machine bounda
 the physical-versus-logical mismatch cannot put a crossing in the wrong place. See
 `ultidesk_topology::arrange`.
 
-### 3. Wire the KVM together as a daemon — **now the top of this list**
+### 3. Wire the KVM together as a daemon — **now the top of this list, and half built**
+
+**Built 2026-09-10**: the crossing decision (`ultidesk_topology::crossing`) and the
+two-machine layout it consults (`agent/topology.rs`, and `ultidesk-agent topology` to
+inspect it). Between the real machines they report 1080px of shared edge, which is what a
+crossing needs.
+
+What is left is the loop rather than the logic — grab, stream, hand back — plus two
+things that will bite while doing it:
+
+- **The daemon does not read the operator's saved arrangement.** It uses the default
+  strip, because the saved layout lives in the control app's settings file and the agent
+  does not own it. Settings want to move behind the IPC so there is one writer; until
+  then the daemon and the editor can disagree about where the screens are.
+- **Emergency release on Linux must come from inside the captured stream**, since evdev
+  grabs every keyboard and nothing else will see the key.
 
 With a transport and an IPC surface, goal 1 becomes real: `serve` watches the pointer,
 consults `Layout` for shared borders, drives `KvmMachine`, and forwards through the
@@ -118,6 +133,9 @@ the assembly.
 The one piece genuinely missing is **hotkey-free emergency release on Linux**. On
 Windows `hotkey.rs` registers one. With evdev grabbing every keyboard, the release has
 to be detected inside the captured stream itself, because nothing else will see it.
+
+Do not run the first grab unattended. Someone should be at the Arch machine with a hand
+on Esc: a grab that does not release leaves that machine reachable only over SSH.
 
 ### 4. Opus for audio, and a native PipeWire playback client
 

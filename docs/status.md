@@ -890,16 +890,77 @@ code the UI calls, but nobody has watched the editor draw a peer's real screen �
 needs someone at a desk, and on the Arch machine a GUI launched over SSH hits the
 `global-hotkey` X11 crash recorded in ADR-0010.
 
+## Built: the KVM's missing decision, and the layout it needs (2026-09-10)
+
+Item 3 — wiring the KVM together — turned out to be missing two things rather than one,
+and neither was a backend.
+
+**The crossing decision** (`ultidesk_topology::crossing`). Everything around it existed:
+`Layout` knew which screens touch, `RemotePointer` tracked the pointer once it was over
+there, `KvmMachine` held the transitions. Nothing answered *this pointer, at this pixel,
+is now the peer's problem, and it should appear there*. Three decisions inside it, each a
+real bug the other way:
+
+- **Only a crossing between machines counts.** Two monitors on one machine share a border
+  too, and the OS already moves the pointer across it. Treating that as a handoff would
+  grab the input every time a window was dragged to the second screen.
+- **The pointer's position alone cannot tell you.** The OS clamps the cursor to the
+  desktop, so it never reaches a coordinate outside it — "is it past the edge?" is always
+  no. What separates pushing *through* an edge from resting against one is the motion the
+  operator asked for, so the intended delta is an input.
+- **The arrangement decides where it lands, not a proportion.** Leaving at y=720 arrives at
+  y=720 whatever the screens' heights are. Scaling instead — what `map_edge_crossing` does
+  — would drop the pointer 240px below the arrangement the operator is looking at. That
+  function stays right for what it was written for: mirroring a whole screen onto a whole
+  screen, where nothing has been arranged and proportion is the only available meaning.
+  **This was written backwards in the first draft and a test caught it.**
+
+**The layout itself** (`agent/topology.rs`), which nothing had ever assembled. Local
+screens from the windowless enumerator, the peer's over the authenticated channel,
+arranged into a strip. `ultidesk-agent topology <peer>` prints it, and between the real
+machines reports:
+
+```
+0: \\.\DISPLAY1             this machine 2496x1664 at (0,0)
+1: eDP-1                    peer         1920x1080 at (2496,0)
+
+pointer at (1120,589) — on \\.\DISPLAY1
+
+\\.\DISPLAY1 -> eDP-1 on its Right, 1080px of shared edge
+```
+
+That is the first thing worth checking when the pointer will not cross, and until now
+nothing could answer it.
+
+The pointer position is reported where the platform will say. Windows will; **Wayland
+deliberately will not** — a client learns the pointer's position only while it is over
+that client's own surface, so a headless agent cannot ask. That is not a gap to work
+around, it is why the Linux side dead-reckons (`ultidesk_platform_linux::pointer`), and
+the diagnostic says so rather than printing nothing.
+
+**418 tests**, clippy `-D warnings` and `cargo fmt --check` clean.
+
+**What is left of the daemon is the loop, not the logic**: grab the local input when a
+crossing fires, stream it over the QUIC channel, and hand back on the return crossing.
+The grab exists on both platforms (`handoff.rs` on Windows, `evdev_capture.rs` on Linux,
+now unblocked), the channel exists, and the decision above tells it when. Nothing has run
+those together yet, and the first run wants someone at the Arch machine with a hand on
+Esc — grabbing every keyboard on a machine nobody is sitting at is not something to try
+unattended.
+
 ## Exact next step
 
-**Look at it.** Every piece of the settings surface is now built and exercised
-head-lessly, and the one thing nobody has done is open the control app and see a peer's
-real monitor drawn next to the local one. That wants a person at one of the machines; on
-Arch it also wants a real session rather than SSH, because of the `global-hotkey` crash in
-[ADR-0010](adrs/0010-dioxus-control-ui.md).
+**Run the KVM loop, with someone present.** The pieces are all built and individually
+verified; what has never happened is grabbing real input on one machine and watching it
+appear on the other through the authenticated channel. It wants a person at the Arch
+machine, because the first thing to test is that the emergency release works.
 
-After that, the next unbuilt thing is the one the whole settings surface was for:
-**wiring the KVM together as a daemon** (next.md item 3). Everything it needs now exists —
-an authenticated channel, a topology both machines agree on, evdev capture unblocked, and
-uinput injection that needs no dialog. What is missing is the assembly: something that
-watches the pointer, notices it hit a shared edge, and hands over.
+Two smaller things that will bite during that, both known:
+
+1. **The daemon does not read the operator's arrangement.** It uses the default strip,
+   because the saved layout lives in the control app's settings file and this process does
+   not own it. Settings need to move behind the IPC so there is one writer — until then
+   the daemon and the editor can disagree about where the screens are.
+2. **Emergency release on Linux has to come from inside the captured stream.** With evdev
+   grabbing every keyboard, nothing else will see the key. On Windows `hotkey.rs`
+   registers one with the OS, which sees it regardless.
