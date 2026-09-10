@@ -56,9 +56,11 @@ pub struct Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        // Best effort. A socket file left behind is not fatal — the next launch detects
-        // it as stale — but leaving one is how the "is the agent running?" question gets
-        // the wrong answer from a directory listing.
+        // Best effort, and not the whole story: `Drop` only runs if the process unwinds
+        // or returns, and a server whose body is `loop { accept }` does neither. A
+        // `SIGTERM` — which is how anything actually stops this agent, `pkill` and
+        // systemd included — kills it outright and leaves the file. That is why `serve`
+        // waits on the signals rather than relying on this.
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -133,19 +135,39 @@ fn clear_stale(path: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Serve clients until the process stops.
+/// Serve clients until the process is asked to stop.
+///
+/// # Why the signals are handled here
+/// Returning normally is what lets [`Listener`]'s `Drop` remove the socket file, and a
+/// bare `loop { accept }` never returns. Under `SIGTERM` — `pkill`, `systemctl stop`, a
+/// session ending — the process dies mid-loop and the file outlives it. Nothing breaks:
+/// the next launch detects it as stale and replaces it. But the leftover file makes a
+/// directory listing claim an agent is running when none is, which is the question
+/// someone debugging this reaches for first.
 pub async fn serve(
     listener: Listener,
     token: String,
     injector: Arc<dyn Injector + Send + Sync>,
 ) -> anyhow::Result<()> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut terminate = signal(SignalKind::terminate()).context("could not watch for SIGTERM")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("could not watch for SIGINT")?;
+
     tracing::info!(path = %listener.path.display(), "local IPC listening");
     loop {
-        let (stream, _addr) = listener
-            .listener
-            .accept()
-            .await
-            .context("accept failed on the IPC socket")?;
+        let accepted = tokio::select! {
+            accepted = listener.listener.accept() => accepted,
+            _ = terminate.recv() => {
+                tracing::info!("SIGTERM: shutting down the local IPC socket");
+                break;
+            }
+            _ = interrupt.recv() => {
+                tracing::info!("SIGINT: shutting down the local IPC socket");
+                break;
+            }
+        };
+        let (stream, _addr) = accepted.context("accept failed on the IPC socket")?;
         let token = token.clone();
         let injector = injector.clone();
         tokio::spawn(async move {
@@ -154,6 +176,12 @@ pub async fn serve(
             }
         });
     }
+
+    // Explicit, because the whole point of breaking out of the loop is to reach it.
+    let path = listener.path.clone();
+    drop(listener);
+    tracing::info!(path = %path.display(), "removed the IPC socket");
+    Ok(())
 }
 
 async fn handle_connection(
