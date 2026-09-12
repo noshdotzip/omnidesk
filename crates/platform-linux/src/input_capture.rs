@@ -148,6 +148,7 @@ mod imp {
     };
     use crate::request::sanitize_token;
     use std::collections::HashMap;
+    use std::os::fd::OwnedFd;
     use zbus::blocking::{Connection, Proxy};
     use zbus::zvariant::{Array, OwnedObjectPath, Structure, Value};
 
@@ -335,6 +336,25 @@ mod imp {
                 .call_method("Disable", &(self.session.clone(), opts))
                 .map_err(bus)?;
             Ok(())
+        }
+
+        /// Open the EIS connection that carries captured input events.
+        ///
+        /// The portal only *arbitrates* capture: it decides when the pointer crosses a
+        /// barrier, but the events themselves arrive over **libei** on this file
+        /// descriptor. Returning an already-authorised fd means the client never needs
+        /// access to the compositor's EIS socket directly.
+        ///
+        /// Direct D-Bus method, so unlike the session setup there is no Request to
+        /// await here.
+        pub fn connect_to_eis(&self) -> Result<OwnedFd, PortalError> {
+            let opts: HashMap<&str, Value> = HashMap::new();
+            let reply = Proxy::new(&self.conn, PORTAL_SERVICE, PORTAL_PATH, INPUT_CAPTURE)
+                .map_err(bus)?
+                .call_method("ConnectToEIS", &(self.session.clone(), opts))
+                .map_err(bus)?;
+            let fd: zbus::zvariant::OwnedFd = reply.body().deserialize().map_err(bus)?;
+            Ok(OwnedFd::from(fd))
         }
 
         pub fn close(&self) -> Result<(), PortalError> {

@@ -15,7 +15,8 @@ import type { IpcRequest, IpcResponse } from "../shared/protocol.js";
 import { PROTOCOL_VERSION } from "../shared/protocol.js";
 
 interface Endpoint {
-  pipe_name: string;
+  /** Named pipe on Windows, Unix socket on Linux; `net.connect` opens both. */
+  endpoint_path: string;
   token: string;
   protocol_version: number;
   pid: number;
@@ -47,7 +48,7 @@ export class AgentClient {
 
   private connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const sock = connect(this.endpoint.pipe_name);
+      const sock = connect(this.endpoint.endpoint_path);
       sock.setEncoding("utf8");
       sock.on("connect", () => resolve());
       sock.on("error", reject);

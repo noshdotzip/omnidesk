@@ -56,6 +56,65 @@ and a renderer bundling step (Vite) that is the next task. Once bundling is wire
 Record results in [compatibility.md](compatibility.md). Until these are run, the
 projection capability stays "Untested".
 
+## Manual test: audio routing (either direction)
+
+Start the **receiver** first so the port is listening, then the sender. Both
+subcommands exist on both platforms; each picks the right backend for its OS.
+
+Arch -> Windows:
+
+```bash
+# Windows
+./target/debug/ultidesk-agent.exe audio-recv 0.0.0.0:45873 120
+# Arch  (find a sink first: pw-cli ls Node | grep -B2 'Audio/Sink')
+./target/debug/ultidesk-agent audio-send <windows-ip>:45873 <sink-name>.monitor 48000 2
+```
+
+Windows -> Arch:
+
+```bash
+# Arch
+./target/debug/ultidesk-agent audio-recv 0.0.0.0:45874 120
+# Windows  (the target argument is ignored; WASAPI captures the default output)
+./target/debug/ultidesk-agent.exe audio-send <arch-ip>:45874 ignored 48000 2
+```
+
+Play something on the sending machine and it should come out of the receiver. Both
+ends print bytes and frames on disconnect; frames / rate should equal the stream
+duration — if it is short, audio was dropped.
+
+Note that killing a side with SIGTERM (including `timeout`) skips its summary, so
+let the *receiver* close the connection if you want the sender's totals.
+
+On Windows the requested rate and channel count are ignored: shared-mode WASAPI does
+not negotiate, so the endpoint's real mix format is detected and reported. If the
+output is set to 5.1 the send is refused rather than mislabelled — set it to stereo.
+
+
+On **Windows** (the receiver), start it first so the port is listening:
+
+```bash
+./target/debug/ultidesk-agent.exe audio-recv 0.0.0.0:45873 120
+```
+
+On **Arch**, find a sink and stream its monitor — the monitor of an *output*, so what
+the machine is playing, not a microphone:
+
+```bash
+pw-cli ls Node | grep -B2 'Audio/Sink'
+./target/debug/ultidesk-agent audio-send <windows-ip>:45873 <sink-name>.monitor 48000 2
+```
+
+Play something on Arch and it should come out of the Windows speakers. The receiver
+prints bytes and frames on disconnect; frames / rate should equal the stream
+duration — if it is short, audio was dropped.
+
+The last argument to `audio-recv` is the latency cap in milliseconds. Lower it for
+tighter sync, raise it if the audio breaks up: the measured WiFi link has ~15 ms mean
+absolute jitter, so a cap below about 50 ms will glitch on it.
+
+Capturing the sink itself rather than its `.monitor` silently sends the wrong thing.
+
 ## Manual test: KVM handoff (Windows ARM64 -> Arch Wayland)
 
 **This grabs your pointer.** While control is on the peer, the Windows cursor stops
@@ -80,8 +139,14 @@ Three independent ways back, each working if the others are broken:
 
 Walking the remote pointer back off the peer's left edge also returns control.
 
-Keyboard is **not** grabbed. Only the mouse is hooked, so a wedged state still
-leaves the keyboard usable — deliberate while the grab path is unproven.
+The keyboard **is** grabbed by default, so keystrokes go to the peer. Pass `false` as
+a seventh argument to hook the mouse only.
+
+A low-level keyboard hook runs *before* the OS dispatches registered hotkeys, so a
+hook that swallowed everything would swallow the emergency combination too. The hook
+therefore never swallows anything while Ctrl+Alt+Shift are held together, and reports
+the release directly. That in-hook route is the one that works when the keyboard is
+grabbed; `RegisterHotKey` remains as an independent second route for when it is not.
 
 If the pointer ever stays stuck after all three routes, that is a serious bug: the
 state machine in `core::kvm` asserts it cannot happen, so capture the exact sequence.

@@ -59,10 +59,10 @@ mod imp {
     use windows::Win32::Foundation::{GetLastError, ERROR_ACCESS_DENIED};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
-        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-        MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
+        MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+        MOUSEEVENTF_WHEEL, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
     };
 
     fn send(inputs: &[INPUT]) -> Result<()> {
@@ -121,6 +121,53 @@ mod imp {
         }])
     }
 
+    /// Inject wheel movement, in Win32 units (multiples of `WHEEL_DELTA`).
+    ///
+    /// Vertical and horizontal are separate `SendInput` events: `MOUSEEVENTF_WHEEL` and
+    /// `MOUSEEVENTF_HWHEEL` both carry their value in `mouseData`, so one event cannot
+    /// express both axes. Sending them as a pair in a single `send` call keeps a
+    /// diagonal swipe from being split by another process' input.
+    ///
+    /// A zero axis is skipped rather than sent as a zero-delta event, which some
+    /// applications treat as a scroll-stop.
+    pub fn mouse_scroll(delta_x: i32, delta_y: i32) -> Result<()> {
+        let mut events: Vec<INPUT> = Vec::with_capacity(2);
+        if delta_y != 0 {
+            events.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: delta_y as u32,
+                        dwFlags: MOUSEEVENTF_WHEEL,
+                        time: 0,
+                        dwExtraInfo: ULTIDESK_INJECT_MARKER,
+                    },
+                },
+            });
+        }
+        if delta_x != 0 {
+            events.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dx: 0,
+                        dy: 0,
+                        mouseData: delta_x as u32,
+                        dwFlags: MOUSEEVENTF_HWHEEL,
+                        time: 0,
+                        dwExtraInfo: ULTIDESK_INJECT_MARKER,
+                    },
+                },
+            });
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        send(&events)
+    }
+
     /// Inject a key by hardware scan code (layout-independent identity of the key), so
     /// the protocol is not tied to ASCII. `down = false` sends the key-up.
     pub fn key_scancode(scan: u16, down: bool) -> Result<()> {
@@ -143,7 +190,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{key_scancode, mouse_button, move_cursor_absolute};
+pub use imp::{key_scancode, mouse_button, mouse_scroll, move_cursor_absolute};
 
 // ---- Non-Windows fallbacks --------------------------------------------------
 
@@ -157,6 +204,10 @@ pub fn mouse_button(_button: MouseButton, _down: bool) -> Result<()> {
 }
 #[cfg(not(windows))]
 pub fn key_scancode(_scan: u16, _down: bool) -> Result<()> {
+    Err(InputError::Unsupported)
+}
+#[cfg(not(windows))]
+pub fn mouse_scroll(_delta_x: i32, _delta_y: i32) -> Result<()> {
     Err(InputError::Unsupported)
 }
 

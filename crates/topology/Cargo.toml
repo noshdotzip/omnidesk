@@ -9,3 +9,8 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 ultidesk-core = { workspace = true }
+
+[dev-dependencies]
+# Only the tests build monitors with fixed device ids, so two machines can be told apart
+# deterministically rather than by chance.
+uuid = { workspace = true }

@@ -49,6 +49,61 @@ We do not use the KWin scripting or `queryWindowInfo` routes. This follows ADR-0
 refusal to work around OS security boundaries, and keeps one code path that also works
 on GNOME and wlroots.
 
+## Can the per-window picker be skipped?
+
+Asked directly, because selecting one window at a time is unusable for a workspace
+where any window should be draggable to another machine. The honest answer is that
+there is **no sanctioned bypass**, and three legitimate options with real trade-offs.
+
+There is no compositor-blessed "capture everything" grant on Wayland. Anything that
+produced one would be defeating the permission model rather than using it, which
+ADR-0006 rules out. What follows is what can actually be built.
+
+### 1. `multiple: true` — one dialog, many windows
+
+`SelectSources` accepts `multiple`, and the picker then lets the user shift-select
+several windows in a single prompt. Combined with `persist_mode = 2` and the returned
+`restore_token`, that becomes *one* prompt covering a set of windows, replayed
+silently on every later launch.
+
+Best fidelity: each window arrives as its own PipeWire stream, composited by the
+compositor, correct even when a window is covered or partly offscreen. Limitation:
+the set is fixed at grant time, so a newly opened window needs a new prompt.
+
+### 2. Capture the monitor once, crop per window
+
+`AvailableSourceTypes` includes `MONITOR`, so one grant covers the whole screen and
+any number of windows can be cropped out of it client-side, including windows opened
+later. One prompt, forever, for everything.
+
+The costs are severe and worth stating plainly:
+
+- **Occlusion breaks it.** A monitor capture is the composited result. A window behind
+  another is simply not in the frame, so its proxy shows whatever is on top of it.
+  Per-window capture does not have this problem because the compositor renders each
+  window separately.
+- **Quality and bandwidth.** Encoding a whole 4K monitor to project one small window
+  wastes most of the bitrate on pixels nobody asked for, then crops away the detail
+  that mattered.
+- **It is screen sharing.** The README's central claim is that Ultidesk is not that.
+  A monitor grant means the app holds the whole screen even while projecting one
+  window, which is exactly the privacy posture the project rejects.
+
+### 3. Per-window grants, remembered forever
+
+Prompt once per window and store its `restore_token` keyed by the application, so a
+given app is approved once and never again. Worst first-run friction, best steady
+state, and it keeps per-window fidelity.
+
+### Decision
+
+Pursue **(1) plus (3)**: `multiple: true` so a session can be authorised in a single
+prompt, and persisted `restore_token`s so it is not re-asked. Option (2) is rejected
+as a default because occlusion makes it *incorrect*, not merely wasteful — a proxy
+window showing the wrong content is worse than one that needed a prompt. It may still
+be worth offering explicitly for a "project my whole screen" mode, which is a
+different feature honestly labelled.
+
 ## Consequences
 
 - The picker UI must be conditional per platform: a list on Windows, a "choose a

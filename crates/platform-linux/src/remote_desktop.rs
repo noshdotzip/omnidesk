@@ -239,6 +239,28 @@ mod imp {
             Ok(())
         }
 
+        /// Scroll by whole wheel steps.
+        ///
+        /// Uses `NotifyPointerAxisDiscrete` rather than `NotifyPointerAxis`: the wire
+        /// protocol already carries whole notches (the sender accumulates fractions),
+        /// and the discrete call is what the compositor turns into the click-stop
+        /// scrolling applications expect. Feeding notches to the continuous call would
+        /// scroll by a handful of pixels instead.
+        ///
+        /// `axis` follows the portal's own numbering: 0 is vertical, 1 is horizontal.
+        /// `steps` is positive-down on the vertical axis, matching Wayland rather than
+        /// Win32, so the caller converts.
+        pub fn pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<(), PortalError> {
+            let opts: HashMap<&str, Value> = HashMap::new();
+            self.portal()?
+                .call_method(
+                    "NotifyPointerAxisDiscrete",
+                    &(self.session.clone(), opts, axis, steps),
+                )
+                .map_err(bus)?;
+            Ok(())
+        }
+
         /// Press or release a key by **evdev** keycode.
         pub fn key(&self, evdev_keycode: i32, pressed: bool) -> Result<(), PortalError> {
             let opts: HashMap<&str, Value> = HashMap::new();

@@ -22,8 +22,11 @@ Thumbs.db
 # Ultidesk local runtime state (never commit secrets/identity)
 .ultidesk-dev/
 *.local.json
-identity/
 secrets/
+# The device private key, wherever a run drops it — a checkout pointed at by
+# ULTIDESK_CONFIG_DIR included. Matched by file name rather than by a directory named
+# `identity/`, which also swallowed the `crates/identity` source crate.
+identity.json
 
 # Generated protocol code (regenerated from protocol/ultidesk.proto)
 packages/protocol-ts/src/generated/

@@ -10,7 +10,12 @@
 //! 1. **Release is unconditional.** An emergency release, a lost peer, or a peer that
 //!    ended the session returns to [`KvmState::Local`] from any state, with no
 //!    precondition that could fail.
-//! 2. **Release actually sticks.** After an emergency release the pointer is usually
+//! 2. **A confined pointer never crosses.** When an application has locked the cursor
+//!    to itself — a first-person game, a CAD viewport, anything using pointer
+//!    confinement or raw input — moving to the screen edge is *aiming*, not a request
+//!    to switch machines. Handing off there would rip the user out of the game
+//!    mid-motion, so crossing is suppressed for as long as the lock is held.
+//! 3. **Release actually sticks.** After an emergency release the pointer is usually
 //!    still sitting on the crossing edge. Re-arming on edge contact alone would grab
 //!    input again on the very next poll, which makes the release button useless
 //!    precisely when it is needed. Crossing stays disarmed until the pointer leaves.
@@ -43,6 +48,12 @@ pub enum KvmEvent {
     EdgeReached,
     /// The pointer moved off the crossing edge.
     EdgeLeft,
+    /// An application locked the pointer to itself, or released it.
+    ///
+    /// While locked, edge contact is meaningless as a crossing signal: the pointer is
+    /// being used to aim, and the OS may be holding it in place regardless of how far
+    /// the user moves the mouse.
+    PointerConfined(bool),
     /// The operator hit the emergency release hotkey.
     EmergencyRelease,
     /// The peer link dropped unexpectedly.
@@ -67,6 +78,8 @@ pub enum KvmOutcome {
 #[derive(Debug, Clone, Copy)]
 pub struct KvmMachine {
     state: KvmState,
+    /// Whether an application currently owns the pointer.
+    confined: bool,
     /// Whether edge contact may start a capture.
     ///
     /// Cleared on release and restored only when the pointer leaves the edge, so a
@@ -84,6 +97,7 @@ impl KvmMachine {
     pub fn new() -> Self {
         KvmMachine {
             state: KvmState::Local,
+            confined: false,
             // Armed at startup: the pointer has not just been released onto an edge.
             armed: true,
         }
@@ -107,6 +121,11 @@ impl KvmMachine {
         self.armed
     }
 
+    /// Whether an application currently owns the pointer.
+    pub fn pointer_confined(&self) -> bool {
+        self.confined
+    }
+
     pub fn on(&mut self, event: KvmEvent) -> KvmOutcome {
         match event {
             // Releases are handled first and identically from any state, so no future
@@ -122,8 +141,21 @@ impl KvmMachine {
                 KvmOutcome::Unchanged
             }
 
+            KvmEvent::PointerConfined(confined) => {
+                let was = self.confined;
+                self.confined = confined;
+                // Becoming confined disarms: a game that grabs the pointer while it
+                // happens to rest on the edge must not hand off the moment it lets go.
+                // Releasing the lock also leaves it disarmed until the pointer moves
+                // off the edge, for the same reason as after an emergency release.
+                if confined != was {
+                    self.armed = false;
+                }
+                KvmOutcome::Unchanged
+            }
+
             KvmEvent::EdgeReached => {
-                if self.state == KvmState::Local && self.armed {
+                if self.state == KvmState::Local && self.armed && !self.confined {
                     self.state = KvmState::Remote;
                     KvmOutcome::Captured
                 } else {
@@ -256,6 +288,67 @@ mod tests {
         assert!(!m.grab_active());
     }
 
+    #[test]
+    fn a_confined_pointer_never_crosses() {
+        // The bug this guards: aiming right in a first-person game reaches the screen
+        // edge, and the user gets ripped onto the other machine mid-fight.
+        let mut m = KvmMachine::new();
+        m.on(KvmEvent::PointerConfined(true));
+        assert!(m.pointer_confined());
+        assert_eq!(m.on(KvmEvent::EdgeReached), KvmOutcome::Unchanged);
+        assert!(!m.grab_active());
+    }
+
+    #[test]
+    fn releasing_a_lock_on_the_edge_does_not_instantly_hand_off() {
+        // Games commonly release the pointer wherever it happens to be. If that spot
+        // is the crossing edge, re-arming immediately would hand off the instant the
+        // user alt-tabs out.
+        let mut m = KvmMachine::new();
+        m.on(KvmEvent::PointerConfined(true));
+        m.on(KvmEvent::PointerConfined(false));
+        assert!(!m.pointer_confined());
+        assert!(!m.armed(), "unlocking must not re-arm on its own");
+        assert_eq!(m.on(KvmEvent::EdgeReached), KvmOutcome::Unchanged);
+
+        // Moving off the edge is the deliberate act that re-arms it.
+        m.on(KvmEvent::EdgeLeft);
+        assert_eq!(m.on(KvmEvent::EdgeReached), KvmOutcome::Captured);
+    }
+
+    #[test]
+    fn a_repeated_confinement_report_does_not_disarm_a_live_setup() {
+        // Confinement is polled, so the same state arrives over and over. Only a
+        // change should disturb the arming, or crossing could never fire while a
+        // background app holds a lock we already know about.
+        let mut m = KvmMachine::new();
+        m.on(KvmEvent::PointerConfined(false));
+        m.on(KvmEvent::PointerConfined(false));
+        assert!(m.armed());
+        assert_eq!(m.on(KvmEvent::EdgeReached), KvmOutcome::Captured);
+    }
+
+    #[test]
+    fn confinement_reported_while_remote_does_not_release_control() {
+        // Input is grabbed, so a local application cannot meaningfully own the
+        // pointer. Treating this as a release would drop the session spuriously.
+        let mut m = captured();
+        assert_eq!(m.on(KvmEvent::PointerConfined(true)), KvmOutcome::Unchanged);
+        assert_eq!(m.state(), KvmState::Remote);
+        assert!(m.grab_active());
+    }
+
+    #[test]
+    fn emergency_release_still_works_while_the_pointer_is_confined() {
+        // The escape hatch must not depend on the pointer being free.
+        let mut m = captured();
+        m.on(KvmEvent::PointerConfined(true));
+        assert!(matches!(
+            m.on(KvmEvent::EmergencyRelease),
+            KvmOutcome::Released(ReleaseReason::EmergencyHotkey)
+        ));
+        assert!(!m.grab_active());
+    }
     #[test]
     fn no_event_sequence_leaves_input_grabbed_after_an_emergency_release() {
         // Exhaustive-ish: for every reachable event ordering that ends in an emergency

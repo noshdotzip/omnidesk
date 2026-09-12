@@ -12,7 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 ultidesk-core = { workspace = true }
+ultidesk-identity = { workspace = true }
+ultidesk-ipc = { workspace = true }
 ultidesk-topology = { workspace = true }
+ultidesk-transport = { workspace = true }
 ultidesk-platform-windows = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -21,7 +24,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal"] }
+
+# Audio playback uses WASAPI through cpal; only the receiving side needs it.
+[target.'cfg(windows)'.dependencies]
+cpal = "0.15"
 
 # The Wayland/portal backend only exists on Linux.
 [target.'cfg(target_os = "linux")'.dependencies]
